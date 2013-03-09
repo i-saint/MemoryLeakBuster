@@ -1,0 +1,4 @@
+disable: 0
+fileoutput: 0
+module: "hogehoge.dll"
+ignore: "!atomic::test"

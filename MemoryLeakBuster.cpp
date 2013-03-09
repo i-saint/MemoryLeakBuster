@@ -157,9 +157,9 @@ bool IsStackMemory(void *addr)
     return addr>=tib->StackLimit && addr<tib->StackBase;
 }
 
-int GetCallstack(void **callstack, int callstack_size, int skip_size)
+int GetCallstack(void **callstack, int callstack_size)
 {
-    return CaptureStackBackTrace(skip_size, callstack_size, callstack, NULL);
+    return CaptureStackBackTrace(1, callstack_size, callstack, NULL);
 }
 
 template<class String>
@@ -173,7 +173,7 @@ void AddressToSymbolName(String &out_text, void *address, HANDLE proc=::GetCurre
     typedef PDWORD PDWORDX;
 #endif
 
-    char buf[1024];
+    char buf[2048];
     HANDLE process = proc;
     IMAGEHLP_MODULE imageModule = { sizeof(IMAGEHLP_MODULE) };
     IMAGEHLP_LINE line ={sizeof(IMAGEHLP_LINE)};
@@ -202,17 +202,36 @@ void AddressToSymbolName(String &out_text, void *address, HANDLE proc=::GetCurre
 }
 
 template<class String>
-void CallstackToSymbolNames(String &out_text, void * const *callstack, int callstack_size, int clamp_head=0, int clamp_tail=0, const char *indent="")
+void CallstackToSymbolNames_Stripped(String &out_text, void * const *callstack, int callstack_size, String &buf)
 {
-    int begin = std::max<int>(0, clamp_head);
-    int end = std::max<int>(0, callstack_size-clamp_tail);
-    for(int i=begin; i<end; ++i) {
-        out_text += indent;
-        AddressToSymbolName(out_text, callstack[i]);
+    buf.clear();
+    for(int i=0; i<callstack_size; ++i) {
+        AddressToSymbolName(buf, callstack[i]);
     }
+
+    size_t begin = 0;
+    size_t end = buf.size();
+    {
+        size_t pos = buf.find("!aligned_malloc ");
+        if(pos==String::npos) { pos = buf.find("!malloc "); }
+        if(pos!=String::npos) {
+            for(;;) {
+                if(buf[++pos]=='\n') { begin = ++pos; break;}
+            }
+        }
+    }
+    {
+        size_t pos = buf.find("!__tmainCRTStartup ", begin);
+        if(pos==String::npos) { pos = buf.find("!endthreadex ", begin); }
+        if(pos==String::npos) { pos = buf.find("!BaseThreadInitThunk ", begin); }
+        if(pos!=String::npos) {
+            for(;;) {
+                if(buf[--pos]=='\n') { end = ++pos; break;}
+            }
+        }
+    }
+    out_text.insert(out_text.end(), buf.begin()+begin, buf.begin()+end);
 }
-
-
 
 
 template<class T>
@@ -415,6 +434,8 @@ public:
         , m_mutex(NULL)
         , m_leakinfo(NULL)
         , m_counter(NULL)
+        , m_modules(NULL)
+        , m_ignores(NULL)
         , m_idgen(0)
         , m_scope(INT_MAX)
     {
@@ -472,10 +493,10 @@ public:
             int i;
             char s[128];
             while(fgets(buf, _countof(buf), f)) {
-                if     (sscanf_s(buf, "disable: %d", &i)==1)        { if(i==1) { ret=false; break; } }
-                else if(sscanf_s(buf, "fileoutput: %d", &i)==1)     { enbaleFileOutput(i!=0); }
-                else if(sscanf_s(buf, "ignore: \"%[^\"]\"", s)==1)  { m_ignores->push_back(s); }
-                else if(sscanf_s(buf, "module: \"%[^\"]\"", s)==1)  { m_modules->push_back(s); }
+                if     (sscanf(buf, "disable: %d", &i)==1)        { if(i==1) { ret=false; break; } }
+                else if(sscanf(buf, "fileoutput: %d", &i)==1)     { enbaleFileOutput(i!=0); }
+                else if(sscanf(buf, "ignore: \"%[^\"]\"", s)==1)  { m_ignores->push_back(s); }
+                else if(sscanf(buf, "module: \"%[^\"]\"", s)==1)  { m_modules->push_back(s); }
             }
             fclose(f);
         }
@@ -502,7 +523,7 @@ public:
         AllocInfo cs;
         cs.location = p;
         cs.bytes = size;
-        cs.callstack_size = GetCallstack(cs.callstack, _countof(cs.callstack), 3);
+        cs.callstack_size = GetCallstack(cs.callstack, _countof(cs.callstack));
         cs.count = 0;
         {
             Mutex::ScopedLock l(*m_mutex);
@@ -538,8 +559,16 @@ public:
                 const AllocInfo &ai = li->second;
                 if(p>=ai.location && (size_t)p<=(size_t)ai.location+ai.bytes) {
                     r = &ai;
-                    if(li!=m_leakinfo->begin()) { auto prev=li; --prev; neighbor[0]=prev->second.location; }
-                    if(li!=m_leakinfo->end())   { auto next=li; ++next; neighbor[1]=next->second.location; }
+                    if(li!=m_leakinfo->begin()) {
+                        auto prev=li; --prev;
+                        neighbor[0]=prev->second.location;
+                    }
+                    {
+                        auto next=li; ++next;
+                        if(next!=m_leakinfo->end()) {
+                            neighbor[1]=next->second.location;
+                        }
+                    } 
                     break;
                 }
             }
@@ -550,13 +579,11 @@ public:
             return;
         }
         char buf[128];
-        TempString text;
+        TempString text, bufstr;
         text.reserve(1024*16);
         sprintf_s(buf, "0x%p (%llu byte) ", r->location, (unsigned long long)r->bytes); text+=buf;
         sprintf_s(buf, "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text+=buf;
-        CallstackToSymbolNames(text, r->callstack, r->callstack_size);
-        text += "\n";
-
+        CallstackToSymbolNames_Stripped(text, r->callstack, r->callstack_size, bufstr);
         OutputDebugStringA(text.c_str());
     }
 
@@ -566,7 +593,7 @@ public:
         if(m_leakinfo==NULL) { return; }
 
         char buf[128];
-        TempString text;
+        TempString text, bufstr;
         text.reserve(1024*16);
         for(auto li=m_leakinfo->begin(); li!=m_leakinfo->end(); ++li) {
             const AllocInfo &ai = li->second;
@@ -574,7 +601,7 @@ public:
             text.clear();
             sprintf_s(buf, "memory leak: 0x%p (%llu byte)\n", ai.location, (unsigned long long)ai.bytes);
             text += buf;
-            CallstackToSymbolNames(text, ai.callstack, ai.callstack_size);
+            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             if(!shouldBeIgnored(text)) {
                 output(text.c_str(), text.size());
@@ -594,7 +621,7 @@ public:
         if(m_leakinfo==NULL) { return; }
 
         char buf[128];
-        TempString text;
+        TempString text, bufstr;
         text.reserve(1024*16);
         for(auto li=m_leakinfo->begin(); li!=m_leakinfo->end(); ++li) {
             const AllocInfo &ai = li->second;
@@ -603,7 +630,7 @@ public:
             text.clear();
             sprintf_s(buf, "maybe a leak: 0x%p (%llu byte)\n", ai.location, (unsigned long long)ai.bytes);
             text += buf;
-            CallstackToSymbolNames(text, ai.callstack, ai.callstack_size);
+            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             if(!shouldBeIgnored(text)) {
                 output(text.c_str(), text.size());
@@ -627,7 +654,7 @@ public:
 
         int total = 0;
         char buf[128];
-        TempString text;
+        TempString text, bufstr;
         text.reserve(1024*16);
         for(auto li=m_counter->begin(); li!=m_counter->end(); ++li) {
             const AllocInfo &ai = *li;
@@ -635,7 +662,7 @@ public:
             text.clear();
             sprintf_s(buf, "%d times from\n", ai.count);
             text += buf;
-            CallstackToSymbolNames(text, ai.callstack, ai.callstack_size);
+            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             output(text.c_str(), text.size());
             total += ai.count;
