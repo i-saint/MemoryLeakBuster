@@ -40,6 +40,9 @@ written by i-saint ( http://primitive-games.jp )
     指定パターンを含むコールスタックのリークを表示しないようにします。
 
 
-
 リークチェックの仕組みは CRT の HeapAlloc/Free を hook することによって実現しています。  
 CRT を static link したモジュールの場合追加の手順が必要で、下の g_crtdllnames に対象モジュールを追加する必要があります。  
+
+![mlb1](/img/mlb1.png "mlb1")
+![mlb2](/img/mlb2.png "mlb2")
+![mlb3](/img/mlb3.png "mlb3")
