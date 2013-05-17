@@ -1,5 +1,8 @@
-﻿#include <cstdlib>
+﻿// created by i-saint
+// distributed under Creative Commons Attribution (CC BY) license.
+// https://github.com/i-saint/MemoryLeakBuster
 
+#include <cstdlib>
 
 int main(int argc, char* argv[])
 {

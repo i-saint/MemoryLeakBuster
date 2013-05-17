@@ -1,7 +1,7 @@
-﻿// this code is public domain.
-// latest version: https://github.com/i-saint/MemoryLeakBuster
-// written by i-saint ( http://primitive-games.jp )
-// 
+﻿// created by i-saint
+// distributed under Creative Commons Attribution (CC BY) license.
+// https://github.com/i-saint/MemoryLeakBuster
+
 // メモリリーク検出器。
 // この .cpp をプロジェクトに含めるだけで有効になり、プログラム終了時にリーク箇所の確保時のコールスタックをデバッグ出力に表示します。
 // 
