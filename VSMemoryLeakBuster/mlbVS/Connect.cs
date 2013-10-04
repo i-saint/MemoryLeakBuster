@@ -133,15 +133,16 @@ namespace mlbVS
 				if(commandName == "mlbVS.Connect.mlbVS")
 				{
 					handled = true;
-                    DoInject();
+                    LaunchAndDoInject();
+                    //DoInject();
 					return;
 				}
 			}
 		}
 
-        public bool DoInject()
+        public bool LaunchAndDoInject()
         {
-            IVsOutputWindowPane Output = (IVsOutputWindowPane)Package.GetGlobalService(typeof(SVsGeneralOutputWindowPane));
+            IVsOutputWindowPane output = (IVsOutputWindowPane)Package.GetGlobalService(typeof(SVsGeneralOutputWindowPane));
 
             String exepath = "";
             String workdir = "";
@@ -163,7 +164,7 @@ namespace mlbVS
                     exepath = cfg.Evaluate("$(LocalDebuggerCommand)");
                     workdir = cfg.Evaluate("$(LocalDebuggerWorkingDirectory)");
                     environment = cfg.Evaluate("$(LocalDebuggerEnvironment)");
-                    Output.OutputString(exepath);
+                    output.OutputString(exepath);
                 }
             }
 
@@ -182,15 +183,21 @@ namespace mlbVS
             IVsDebugger idbg = (IVsDebugger)Package.GetGlobalService(typeof(SVsShellDebugger));
             if (idbg.LaunchDebugTargets(1, ptr) == VSConstants.S_OK)
             {
-                Debugger dbg = _applicationObject.Debugger;
-                Process proc = dbg.DebuggedProcesses.Item(1);
-                if (mlbInjector.Injector.Inject((UInt32)proc.ProcessID))
-                {
-                    Output.OutputString("\nok\n");
-                    return true;
-                }
+                return DoInject();
             }
+            return false;
+        }
 
+        bool DoInject()
+        {
+            IVsOutputWindowPane output = (IVsOutputWindowPane)Package.GetGlobalService(typeof(SVsGeneralOutputWindowPane));
+            Debugger dbg = _applicationObject.Debugger;
+            Process proc = dbg.DebuggedProcesses.Item(1);
+            if (mlbInjector.Injector.Inject((UInt32)proc.ProcessID))
+            {
+                output.OutputString("\nok\n");
+                return true;
+            }
             return false;
         }
 

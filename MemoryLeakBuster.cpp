@@ -91,10 +91,12 @@ const char *g_ignore_list[] = {
 #include <windows.h>
 #include <dbghelp.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <string>
 #include <vector>
 #include <map>
 #include <set>
+#include <algorithm>
 #define mlbForceLink   __declspec(dllexport)
 
 namespace mlb {
@@ -812,17 +814,52 @@ namespace mlb {
 // global 変数にすることで main 開始前に初期化、main 抜けた後に終了処理をさせる。
 mlbInitializer g_initializer;
 } // namespace mlb
-#endif // mlbDLL
 
-#ifndef mlbDLL
+#else // mlbDLL
+
+// F: [](DWORD thread_id)->void
+template<class F>
+inline void EnumerateThreads(DWORD pid, const F &f)
+{
+    HANDLE ss = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if(ss!=INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        if(::Thread32First(ss, &te)) {
+            do {
+                if(te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID)+sizeof(te.th32OwnerProcessID) &&
+                    te.th32OwnerProcessID==pid)
+                {
+                    f(te.th32ThreadID);
+                }
+                te.dwSize = sizeof(te);
+            } while(::Thread32Next(ss, &te));
+        }
+        ::CloseHandle(ss);
+    }
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if(fdwReason==DLL_PROCESS_ATTACH) {
+        std::vector<HANDLE> threads;
+        EnumerateThreads(GetCurrentProcessId(), [&](DWORD tid){
+            if(tid==GetCurrentThreadId()) { return; }
+            if(HANDLE thread=::OpenThread(THREAD_ALL_ACCESS, FALSE, tid)) {
+                ::SuspendThread(thread);
+                threads.push_back(thread);
+            }
+        });
         mlb::g_mlb = new mlb::MemoryLeakBuster();
+        std::for_each(threads.begin(), threads.end(), [](HANDLE thread){
+            ::ResumeThread(thread);
+            ::CloseHandle(thread);
+        });
     }
     else if(fdwReason==DLL_PROCESS_DETACH) {
         delete mlb::g_mlb;
     }
     return TRUE;
 }
+
 #endif // mlbDLL
