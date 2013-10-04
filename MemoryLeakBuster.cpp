@@ -383,20 +383,26 @@ void SaveOrigHeapAlloc()
     HeapFree_Orig   = &HeapFree;
 }
 
+void HookHeapAlloc(const char *modulename)
+{
+    EachImportFunction(::GetModuleHandleA(modulename), "kernel32.dll", [](const char *funcname, void *&func){
+        if(strcmp(funcname, "HeapAlloc")==0) {
+            ForceWrite<void*>(func, HeapAlloc_Hooked);
+        }
+        else if(strcmp(funcname, "HeapReAlloc")==0) {
+            ForceWrite<void*>(func, HeapReAlloc_Hooked);
+        }
+        else if(strcmp(funcname, "HeapFree")==0) {
+            ForceWrite<void*>(func, HeapFree_Hooked);
+        }
+    });
+}
+
 void HookHeapAlloc(const StringCont &modules)
 {
+    HookHeapAlloc(nullptr);
     for(size_t i=0; i<modules.size(); ++i) {
-        EachImportFunction(::GetModuleHandleA(modules[i].c_str()), "kernel32.dll", [](const char *funcname, void *&func){
-            if(strcmp(funcname, "HeapAlloc")==0) {
-                ForceWrite<void*>(func, HeapAlloc_Hooked);
-            }
-            else if(strcmp(funcname, "HeapReAlloc")==0) {
-                ForceWrite<void*>(func, HeapReAlloc_Hooked);
-            }
-            else if(strcmp(funcname, "HeapFree")==0) {
-                ForceWrite<void*>(func, HeapFree_Hooked);
-            }
-        });
+        HookHeapAlloc(modules[i].c_str());
     }
 }
 
@@ -752,31 +758,27 @@ private:
     Flags m_flags;
 };
 
-#pragma warning(disable: 4073) // init_seg(lib) 使うと出る warning。正当な理由があるので黙らせる
-#pragma init_seg(lib) // global オブジェクトの初期化の優先順位上げる
-// global 変数にすることで main 開始前に初期化、main 抜けた後に終了処理をさせる。
-MemoryLeakBuster g_mlb;
-
+MemoryLeakBuster *g_mlb;
 
 LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes )
 {
     LPVOID p = HeapAlloc_Orig(hHeap, dwFlags, dwBytes);
-    g_mlb.addHeapInfo(p, dwBytes);
+    g_mlb->addHeapInfo(p, dwBytes);
     return p;
 }
 
 LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes )
 {
-    g_mlb.eraseHeapInfo(lpMem);
+    g_mlb->eraseHeapInfo(lpMem);
     LPVOID p = HeapReAlloc_Orig(hHeap, dwFlags, lpMem, dwBytes);
-    g_mlb.addHeapInfo(p, dwBytes);
+    g_mlb->addHeapInfo(p, dwBytes);
     return p;
 }
 
 BOOL WINAPI HeapFree_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem )
 {
     BOOL r = HeapFree_Orig(hHeap, dwFlags, lpMem);
-    g_mlb.eraseHeapInfo(lpMem);
+    g_mlb->eraseHeapInfo(lpMem);
     return r;
 }
 
@@ -787,11 +789,40 @@ using namespace mlb;
 
 // イミディエイトウィンドウから実行可能な関数群
 typedef mlb::MemoryLeakBuster::HeapInfo HeapInfo;
-mlbForceLink const HeapInfo* mlbGetHeapInfo(void *p){ return g_mlb.getHeapInfo(p); }
+mlbForceLink const HeapInfo* mlbGetHeapInfo(void *p){ return g_mlb->getHeapInfo(p); }
 
-mlbForceLink void mlbInspect(void *p)           { g_mlb.inspect(p); }
-mlbForceLink void mlbBeginScope()               { g_mlb.beginScope(); }
-mlbForceLink void mlbEndScope()                 { g_mlb.endScope(); }
-mlbForceLink void mlbBeginCount()               { g_mlb.beginCount(); }
-mlbForceLink void mlbEndCount()                 { g_mlb.endCount(); }
-mlbForceLink void mlbOutputToFile(bool v)       { g_mlb.enbaleFileOutput(v); }
+mlbForceLink void mlbInspect(void *p)           { g_mlb->inspect(p); }
+mlbForceLink void mlbBeginScope()               { g_mlb->beginScope(); }
+mlbForceLink void mlbEndScope()                 { g_mlb->endScope(); }
+mlbForceLink void mlbBeginCount()               { g_mlb->beginCount(); }
+mlbForceLink void mlbEndCount()                 { g_mlb->endCount(); }
+mlbForceLink void mlbOutputToFile(bool v)       { g_mlb->enbaleFileOutput(v); }
+
+#ifndef mlbDLL
+class mlbInitializer
+{
+public:
+    mlbInitializer() { mlb::g_mlb=new mlb::MemoryLeakBuster(); }
+    ~mlbInitializer() { delete mlb::g_mlb; }
+};
+
+namespace mlb {
+#pragma warning(disable: 4073) // init_seg(lib) 使うと出る warning。正当な理由があるので黙らせる
+#pragma init_seg(lib) // global オブジェクトの初期化の優先順位上げる
+// global 変数にすることで main 開始前に初期化、main 抜けた後に終了処理をさせる。
+mlbInitializer g_initializer;
+} // namespace mlb
+#endif // mlbDLL
+
+#ifndef mlbDLL
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
+    if(fdwReason==DLL_PROCESS_ATTACH) {
+        mlb::g_mlb = new mlb::MemoryLeakBuster();
+    }
+    else if(fdwReason==DLL_PROCESS_DETACH) {
+        delete mlb::g_mlb;
+    }
+    return TRUE;
+}
+#endif // mlbDLL
