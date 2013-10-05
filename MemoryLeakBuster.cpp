@@ -53,6 +53,8 @@ const size_t MaxCallstackDepth = 64;
 // EnumProcessModules でロードされている全モジュールに仕掛けることもできるが、色々誤判定されるので絞ったほうがいいと思われる。
 // /MT や /MTd でビルドされたモジュールのリークチェックをしたい場合、このリストに対象モジュールを書けばいけるはず。
 const char *g_target_modules[] = {
+    "msvcr120.dll",
+    "msvcr120d.dll",
     "msvcr110.dll",
     "msvcr110d.dll",
     "msvcr100.dll",
@@ -817,6 +819,8 @@ mlbInitializer g_initializer;
 
 #else // mlbDLL
 
+#include "Addin/mlbInjector/SetThreadTrap.h"
+
 // F: [](DWORD thread_id)->void
 template<class F>
 inline void EnumerateThreads(DWORD pid, const F &f)
@@ -842,18 +846,15 @@ inline void EnumerateThreads(DWORD pid, const F &f)
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if(fdwReason==DLL_PROCESS_ATTACH) {
-        std::vector<HANDLE> threads;
+        mlb::g_mlb = new mlb::MemoryLeakBuster();
+
+        HMODULE kernel32 = ::GetModuleHandleA("kernel32.dll");
+        UnsetThreadTrap(GetCurrentProcess(), ::GetProcAddress(kernel32, "SetUnhandledExceptionFilter"));
         EnumerateThreads(GetCurrentProcessId(), [&](DWORD tid){
             if(tid==GetCurrentThreadId()) { return; }
             if(HANDLE thread=::OpenThread(THREAD_ALL_ACCESS, FALSE, tid)) {
-                ::SuspendThread(thread);
-                threads.push_back(thread);
+                DWORD ret = ::ResumeThread(thread);
             }
-        });
-        mlb::g_mlb = new mlb::MemoryLeakBuster();
-        std::for_each(threads.begin(), threads.end(), [](HANDLE thread){
-            ::ResumeThread(thread);
-            ::CloseHandle(thread);
         });
     }
     else if(fdwReason==DLL_PROCESS_DETACH) {

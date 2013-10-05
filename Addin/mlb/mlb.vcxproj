@@ -106,6 +106,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\MemoryLeakBuster.cpp" />
+    <ClCompile Include="..\mlbInjector\SetThreadTrap.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\mlbInjector\SetThreadTrap.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
