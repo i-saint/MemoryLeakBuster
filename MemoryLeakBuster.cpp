@@ -803,6 +803,7 @@ mlbForceLink void mlbEndCount()                 { g_mlb->endCount(); }
 mlbForceLink void mlbOutputToFile(bool v)       { g_mlb->enbaleFileOutput(v); }
 
 #ifndef mlbDLL
+
 class mlbInitializer
 {
 public:
@@ -816,51 +817,5 @@ namespace mlb {
 // global 変数にすることで main 開始前に初期化、main 抜けた後に終了処理をさせる。
 mlbInitializer g_initializer;
 } // namespace mlb
-
-#else // mlbDLL
-
-#include "Addin/mlbInjector/SetThreadTrap.h"
-
-// F: [](DWORD thread_id)->void
-template<class F>
-inline void EnumerateThreads(DWORD pid, const F &f)
-{
-    HANDLE ss = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if(ss!=INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(te);
-        if(::Thread32First(ss, &te)) {
-            do {
-                if(te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID)+sizeof(te.th32OwnerProcessID) &&
-                    te.th32OwnerProcessID==pid)
-                {
-                    f(te.th32ThreadID);
-                }
-                te.dwSize = sizeof(te);
-            } while(::Thread32Next(ss, &te));
-        }
-        ::CloseHandle(ss);
-    }
-}
-
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
-{
-    if(fdwReason==DLL_PROCESS_ATTACH) {
-        mlb::g_mlb = new mlb::MemoryLeakBuster();
-
-        HMODULE kernel32 = ::GetModuleHandleA("kernel32.dll");
-        UnsetThreadTrap(GetCurrentProcess(), ::GetProcAddress(kernel32, "SetUnhandledExceptionFilter"));
-        EnumerateThreads(GetCurrentProcessId(), [&](DWORD tid){
-            if(tid==GetCurrentThreadId()) { return; }
-            if(HANDLE thread=::OpenThread(THREAD_ALL_ACCESS, FALSE, tid)) {
-                DWORD ret = ::ResumeThread(thread);
-            }
-        });
-    }
-    else if(fdwReason==DLL_PROCESS_DETACH) {
-        delete mlb::g_mlb;
-    }
-    return TRUE;
-}
 
 #endif // mlbDLL

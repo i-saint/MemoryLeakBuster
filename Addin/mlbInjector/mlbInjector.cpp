@@ -8,8 +8,8 @@
 #include <functional>
 #include <algorithm>
 
+#include "../mlbInternal.h"
 #include "mlbInjector.h"
-#include "SetThreadTrap.h"
 
 #define AddInDir "\\Documents\\Visual Studio 2012\\Addins\\"
 #ifdef _M_IX64
@@ -19,56 +19,7 @@
 #endif // _M_IX64
 #define KernelDLLFileName "kernel32.dll"
 
-namespace mlbInjector {
-
-// F: [](HMODULE mod)->void
-template<class F>
-inline void EnumerateModules(HANDLE process, const F &f)
-{
-    std::vector<HMODULE> modules;
-    DWORD num_modules = 0;
-    ::EnumProcessModules(process, nullptr, 0, &num_modules);
-    modules.resize(num_modules/sizeof(HMODULE));
-    ::EnumProcessModules(process, &modules[0], num_modules, &num_modules);
-    for(size_t i=0; i<modules.size(); ++i) {
-        f(modules[i]);
-    }
-}
-
-// F: [](DWORD thread_id)->void
-template<class F>
-inline void EnumerateThreads(DWORD pid, const F &f)
-{
-    HANDLE ss = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if(ss!=INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(te);
-        if(::Thread32First(ss, &te)) {
-            do {
-                if(te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID)+sizeof(te.th32OwnerProcessID) &&
-                    te.th32OwnerProcessID==pid)
-                {
-                    f(te.th32ThreadID);
-                }
-                te.dwSize = sizeof(te);
-            } while(::Thread32Next(ss, &te));
-        }
-        ::CloseHandle(ss);
-    }
-}
-
-static HMODULE FindModule(HANDLE process, const char* dllname)
-{
-    HMODULE ret = nullptr;
-    EnumerateModules(process, [&](HMODULE mod){
-        char path[MAX_PATH];
-        ::GetModuleFileNameExA(process, mod, path, MAX_PATH);
-        if(strstr(path, KernelDLLFileName)) {
-            ret = mod;
-        }
-    });
-    return ret;
-}
+namespace mlb {
 
 static bool InjectDLL(HANDLE process, const char* dllname)
 {
@@ -96,7 +47,7 @@ static bool InjectDLL(HANDLE process, const char* dllname)
     return hThread!=nullptr;
 }
 
-static bool DoInject(DWORD processID)
+bool Injector::Inject(DWORD processID)
 {
     HANDLE process = ::OpenProcess(PROCESS_ALL_ACCESS, FALSE, processID);
     if(!process) {
@@ -104,7 +55,7 @@ static bool DoInject(DWORD processID)
     }
 
     std::vector<HANDLE> threads;
-    EnumerateThreads(processID, [&](DWORD tid){
+    EnumerateThreads(process, [&](DWORD tid){
         if(HANDLE thread=::OpenThread(THREAD_ALL_ACCESS, FALSE, tid)) {
             ::SuspendThread(thread);
             threads.push_back(thread);
@@ -129,10 +80,4 @@ static bool DoInject(DWORD processID)
     ::CloseHandle(process);
     return result;
 }
-
-bool Injector::Inject(DWORD processID)
-{
-    return DoInject(processID);
-}
-
-} // namespace mlbInjector
+} // namespace mlb

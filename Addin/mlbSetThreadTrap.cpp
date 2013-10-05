@@ -1,5 +1,4 @@
-﻿#include "stdafx.h"
-#include <windows.h>
+﻿#include <windows.h>
 #include <psapi.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
@@ -9,53 +8,9 @@
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
 
-// 指定の関数の先頭に現在のスレッドを suspend するコードをねじ込む
-bool SetThreadTrap(HANDLE process, void *target); // target: hotpatch 可能な関数のアドレス
-bool SetThreadTrap(HANDLE process, const char *sym_name); // sym_name: hotpatch 可能な関数のシンボル名
+#include "mlbInternal.h"
 
-// SetThreadTrap() でねじ込んだ suspend コードを解除
-bool UnsetThreadTrap(HANDLE process, void *target);
-bool UnsetThreadTrap(HANDLE process, const char *sym_name);
-
-
-
-
-// F: [](HMODULE mod)->void
-template<class F>
-inline void EnumerateModules(HANDLE process, const F &f)
-{
-    std::vector<HMODULE> modules;
-    DWORD num_modules = 0;
-    ::EnumProcessModules(process, nullptr, 0, &num_modules);
-    modules.resize(num_modules/sizeof(HMODULE));
-    ::EnumProcessModules(process, &modules[0], num_modules, &num_modules);
-    for(size_t i=0; i<modules.size(); ++i) {
-        f(modules[i]);
-    }
-}
-
-// F: [](DWORD thread_id)->void
-template<class F>
-inline void EnumerateThreads(DWORD pid, const F &f)
-{
-    HANDLE ss = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if(ss!=INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(te);
-        if(::Thread32First(ss, &te)) {
-            do {
-                if(te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID)+sizeof(te.th32OwnerProcessID) &&
-                    te.th32OwnerProcessID==pid)
-                {
-                    f(te.th32ThreadID);
-                }
-                te.dwSize = sizeof(te);
-            } while(::Thread32Next(ss, &te));
-        }
-        ::CloseHandle(ss);
-    }
-}
-
+namespace mlb {
 
 /*
 // trap の元ソース
@@ -194,8 +149,7 @@ template<class F>
 static inline void SuspendThreadBlock(HANDLE process, const F &f)
 {
     std::vector<HANDLE> threads;
-    DWORD pid = ::GetProcessId(process);
-    EnumerateThreads(pid, [&](DWORD tid){
+    EnumerateThreads(process, [&](DWORD tid){
         if(tid==GetCurrentThreadId()) { return; }
         if(HANDLE thread=::OpenThread(THREAD_ALL_ACCESS, FALSE, tid)) {
             ::SuspendThread(thread);
@@ -259,3 +213,4 @@ bool UnsetThreadTrap(HANDLE process, const char *sym_name)
     return ret;
 }
 
+} // namespace mlb

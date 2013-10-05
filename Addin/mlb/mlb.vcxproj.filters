@@ -15,16 +15,14 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\MemoryLeakBuster.cpp">
+    <ClCompile Include="..\mlbDLL.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\mlbInjector\SetThreadTrap.cpp">
+    <ClCompile Include="..\mlbSetThreadTrap.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="..\mlbInjector\SetThreadTrap.h">
+    <ClCompile Include="..\mlbInternal.cpp">
       <Filter>Source Files</Filter>
-    </ClInclude>
+    </ClCompile>
   </ItemGroup>
 </Project>

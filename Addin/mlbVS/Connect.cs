@@ -13,7 +13,7 @@ using Microsoft.VisualStudio.VCProjectEngine;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.VisualStudio.Debugger.Interop;
-using mlbInjector;
+using mlb;
 
 namespace mlbVS
 {
@@ -193,7 +193,7 @@ namespace mlbVS
             IVsOutputWindowPane output = (IVsOutputWindowPane)Package.GetGlobalService(typeof(SVsGeneralOutputWindowPane));
             Debugger dbg = _applicationObject.Debugger;
             Process proc = dbg.DebuggedProcesses.Item(1);
-            if (mlbInjector.Injector.Inject((UInt32)proc.ProcessID))
+            if (Injector.Inject((UInt32)proc.ProcessID))
             {
                 output.OutputString("\nok\n");
                 return true;

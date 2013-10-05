@@ -2,12 +2,11 @@
 
 #pragma once
 
-using namespace System;
+namespace mlb {
 
-namespace mlbInjector {
+public ref class Injector
+{
+public: static bool Inject(DWORD processID);
+};
 
-	public ref class Injector
-	{
-    public: static bool Inject(DWORD processID);
-	};
-}
+} // namespace mlb
