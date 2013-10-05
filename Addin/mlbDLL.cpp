@@ -6,6 +6,8 @@
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if(fdwReason==DLL_PROCESS_ATTACH) {
+        ::Sleep(1000);
+
         mlb::g_mlb = new mlb::MemoryLeakBuster();
 
         HANDLE process = GetCurrentProcess();
