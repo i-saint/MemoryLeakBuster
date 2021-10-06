@@ -127,6 +127,7 @@ static LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwByt
 static LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
 static BOOL   WINAPI HeapFree_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
 
+
 static nanosec mlbNow()
 {
     using namespace std::chrono;
@@ -164,7 +165,7 @@ static void FinalizeDebugSymbol(HANDLE proc=::GetCurrentProcess())
 }
 
 // 指定のアドレスが現在のモジュールの static 領域内であれば true
-// * 呼び出し元モジュールの static 領域しか判別できません
+// ** 呼び出し元モジュールの static 領域しか判別しない **
 static bool IsStaticMemory(void *addr)
 {
     MODULEINFO modinfo;
@@ -178,7 +179,7 @@ static bool IsStaticMemory(void *addr)
 }
 
 // 指定アドレスが現在のスレッドの stack 領域内であれば true
-// * 現在のスレッドの stack しか判別できません
+// ** 現在のスレッドの stack しか判別しない **
 static bool IsStackMemory(void* addr)
 {
     NT_TIB *tib = reinterpret_cast<NT_TIB*>(::NtCurrentTeb());
@@ -356,7 +357,7 @@ static inline void ForceWrite(T &dst, const T &src)
 }
 
 
-// F: functor。引数は (const char *dllname, const char *funcname, void *&func)
+// F: [](const char *dllname, const char *funcname, void *&func) -> void
 template<class F>
 static bool EachImportFunction(HMODULE module, const F& f)
 {
@@ -446,6 +447,7 @@ static void UnhookHeapAlloc(const StringCont &modules)
     }
 }
 
+
 class MemoryLeakBuster
 {
 public:
@@ -485,304 +487,30 @@ public:
         uint32_t i;
     };
 
-    MemoryLeakBuster()
-    {
-        SaveOrigHeapAlloc();
-        m_flags.i = 0;
-        m_flags.enable_leakcheck = 1;
-        m_mutex     = mlbNew<Mutex>();
-        m_heapinfo  = mlbNew<HeapTable>();
-        m_counter   = mlbNew<CountTable>();
-        m_modules   = mlbNew<StringCont>();
-        m_ignores   = mlbNew<StringCont>();
-        loadConfig();
-        InitializeDebugSymbol();
-        HookHeapAlloc(*m_modules);
-    }
+public:
+    MemoryLeakBuster(const MemoryLeakBuster&) = delete;
+    MemoryLeakBuster& operator=(const MemoryLeakBuster&) = delete;
 
-    ~MemoryLeakBuster()
-    {
-        if (!m_mutex)
-            return;
-        Mutex::ScopedLock l(*m_mutex);
+    MemoryLeakBuster();
+    ~MemoryLeakBuster();
 
-        UnhookHeapAlloc(*m_modules);
-        printLeakInfo();
-
-        // 解放後もアクセスされる可能性がある点に注意が必要
-        // 全チェックを無効化して他のメンバ変数にアクセスされないようにします
-        m_flags.i = 0;
-        mlbDelete(m_ignores);  m_ignores = nullptr;
-        mlbDelete(m_modules);  m_modules = nullptr;
-        mlbDelete(m_counter);  m_counter = nullptr;
-        mlbDelete(m_heapinfo); m_heapinfo = nullptr;
-
-        // m_mutex は開放しません
-        // 別スレッドから HeapFree_Hooked() が呼ばれて mutex を待ってる間に
-        // ここでその mutex を破棄してしまうとクラッシュしてしまうためです。
-
-        enbaleFileOutput(false);
-        FinalizeDebugSymbol();
-    }
-
-    bool loadConfig()
-    {
-        for (auto* mod : g_target_modules)
-            m_modules->push_back(mod);
-
-        for (auto* pattern : g_ignore_list)
-            m_ignores->push_back(pattern);
-
-        char buf[256];
-        if (FILE* f = fopen("mlbConfig.txt", "r")) {
-            int i;
-            char s[128]{};
-            while (fgets(buf, (int)std::size(buf), f)) {
-                if (sscanf(buf, "disable: %d", &i) == 1) { m_flags.enable_leakcheck = (i != 1); }
-                else if (sscanf(buf, "fileoutput: %d", &i) == 1) { enbaleFileOutput(i != 0); }
-                else if (sscanf(buf, "ignore: \"%[^\"]\"", s) == 1) { m_ignores->push_back(s); }
-                else if (sscanf(buf, "module: \"%[^\"]\"", s) == 1) { m_modules->push_back(s); }
-            }
-            fclose(f);
-            return true;
-        }
-        return false;
-    }
-
-    void enbaleFileOutput(bool v)
-    {
-        if (v && !m_logfile) {
-            m_logfile = fopen("mlbLog.txt", "wb");
-        }
-        else if (!v && m_logfile) {
-            fclose(m_logfile);
-            m_logfile = nullptr;
-        }
-    }
-
-    void addHeapInfo(void *p, size_t size)
-    {
-        if (!p || m_flags.i == 0)
-            return;
-
-        HeapInfo cs;
-        cs.address = p;
-        cs.size = size;
-        cs.time = mlbNow();
-        cs.callstack_size = GetCallstack(cs.callstack);
-        cs.count = 0;
-        {
-            Mutex::ScopedLock l(*m_mutex);
-            if(m_flags.enable_leakcheck || m_flags.enable_scopedcheck) {
-                cs.id = ++m_idgen;
-                (*m_heapinfo)[p] = cs;
-            }
-            if(m_flags.enable_counter) {
-                auto r = m_counter->insert(cs);
-                const_cast<HeapInfo&>(*r.first).count++;
-            }
-        }
-    }
-
-    void eraseHeapInfo(void *p)
-    {
-        if (!p || (m_flags.enable_leakcheck == 0 && m_flags.enable_scopedcheck == 0))
-            return;
-        Mutex::ScopedLock l(*m_mutex);
-        if (m_heapinfo)
-            m_heapinfo->erase(p);
-    }
+    bool loadConfig();
+    void enbaleFileOutput(bool v);
+    void addHeapInfo(void* p, size_t size);
+    void eraseHeapInfo(void* p);
 
     // lock しない。内部実装用
-    HeapTable::const_iterator _findHeapInfo(void *p) const
-    {
-        if (m_heapinfo->empty())
-            return m_heapinfo->end();
+    HeapTable::const_iterator _findHeapInfo(void* p) const;
+    const HeapInfo* getHeapInfo(void* p);
+    void inspect(void* p) const;
+    void printLeakInfo() const;
 
-        auto i = m_heapinfo->lower_bound(p);
-        if (i == m_heapinfo->end() || (p != i->first && i != m_heapinfo->begin()))
-            --i;
-
-        auto& hi = i->second;
-        if (p >= hi.address && p <= (void*)((size_t)hi.address + hi.size))
-            return i;
-        return m_heapinfo->end();
-    }
-
-    const HeapInfo* getHeapInfo(void *p)
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        if (!m_heapinfo)
-            return nullptr;
-
-        auto i = _findHeapInfo(p);
-        if (i == m_heapinfo->end())
-            return nullptr;
-        return &i->second;
-    }
-
-    void inspect(void *p) const
-    {
-        if (IsStaticMemory(p)) {
-            ::OutputDebugStringA("static memory\n");
-            return;
-        }
-        if (IsStackMemory(p)) {
-            ::OutputDebugStringA("stack memory\n");
-            return;
-        }
-
-        const HeapInfo *r = nullptr;
-        const void *neighbor[2] = { nullptr, nullptr };
-        {
-            Mutex::ScopedLock l(*m_mutex);
-            if (!m_heapinfo)
-                return;
-
-            auto li = _findHeapInfo(p);
-            if(li!=m_heapinfo->end()) {
-                const HeapInfo &ai = li->second;
-                r = &ai;
-                if(li!=m_heapinfo->begin()) {
-                    auto prev=li; --prev;
-                    neighbor[0]=prev->second.address;
-                }
-                {
-                    auto next=li; ++next;
-                    if(next!=m_heapinfo->end()) {
-                        neighbor[1]=next->second.address;
-                    }
-                } 
-            }
-        }
-
-        if (!r) {
-            ::OutputDebugStringA("no information.\n");
-            return;
-        }
-        char buf[128];
-        TempString text, bufstr;
-        text.reserve(1024*16);
-        snprintf(buf, std::size(buf), "0x%p (%zu byte) ", r->address, r->size); text+=buf;
-        snprintf(buf, std::size(buf), "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text+=buf;
-        CallstackToSymbolNamesStripped(text, r->callstack, r->callstack_size, bufstr);
-        ::OutputDebugStringA(text.c_str());
-    }
-
-    void printLeakInfo() const
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        if (!m_heapinfo)
-            return;
-
-        char buf[128];
-        TempString text, bufstr;
-        text.reserve(1024*16);
-        for (auto& kvp : *m_heapinfo) {
-            const auto& ai = kvp.second;
-
-            text.clear();
-            snprintf(buf, std::size(buf), "memory leak: 0x%p (%zu byte)\n", ai.address, ai.size);
-            text += buf;
-            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
-            text += "\n";
-            if (!shouldBeIgnored(text)) {
-                output(text.c_str(), text.size());
-            }
-        }
-    }
-
-
-    void beginScope()
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        m_flags.enable_scopedcheck = 1;
-        m_scope = m_idgen;
-    }
-
-    void endScope()
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        if (!m_heapinfo)
-            return;
-
-        char buf[128];
-        TempString text, bufstr;
-        text.reserve(1024*16);
-        for (auto& kvp : *m_heapinfo) {
-            const auto& ai = kvp.second;
-            if (ai.id < m_scope)
-                continue;
-
-            text.clear();
-            snprintf(buf, std::size(buf), "maybe a leak: 0x%p (%zu byte)\n", ai.address, ai.size);
-            text += buf;
-            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
-            text += "\n";
-            if(!shouldBeIgnored(text)) {
-                output(text.c_str(), text.size());
-            }
-        }
-        m_scope = INT_MAX;
-        m_flags.enable_scopedcheck = 0;
-    }
-
-
-    void beginCount()
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        m_flags.enable_counter = 1;
-    }
-
-    void endCount()
-    {
-        Mutex::ScopedLock l(*m_mutex);
-        if (!m_flags.enable_counter)
-            return;
-
-        int total = 0;
-        char buf[128];
-        TempString text, bufstr;
-        text.reserve(1024 * 16);
-        for (auto& kvp : *m_heapinfo) {
-            const auto& ai = kvp.second;
-
-            text.clear();
-            snprintf(buf, std::size(buf), "%d times from\n", ai.count);
-            text += buf;
-            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
-            text += "\n";
-            output(text.c_str(), text.size());
-            total += ai.count;
-        }
-        snprintf(buf, std::size(buf), "total %d times\n", total);
-        output(buf);
-
-        m_flags.enable_counter = 0;
-    }
-
-
-    bool shouldBeIgnored(const TempString &callstack) const
-    {
-        for (auto& ignore : *m_ignores) {
-            if (callstack.find(ignore.c_str()) != std::string::npos) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void output(const char *str, size_t len=0) const
-    {
-        if (m_logfile) {
-            if (len == 0)
-                len = strlen(str);
-            fwrite(str, 1, len, m_logfile);
-        }
-        else {
-            ::OutputDebugStringA(str);
-        }
-    }
+    void beginScope();
+    void endScope();
+    void beginCount();
+    void endCount();
+    bool shouldBeIgnored(const TempString& callstack) const;
+    void output(const char* str, size_t len = 0) const;
 
 private:
     FILE *m_logfile = nullptr;
@@ -795,6 +523,305 @@ private:
     uint32_t m_scope = INT_MAX;
     Flags m_flags{};
 };
+
+MemoryLeakBuster::MemoryLeakBuster()
+{
+    SaveOrigHeapAlloc();
+    m_flags.i = 0;
+    m_flags.enable_leakcheck = 1;
+    m_mutex = mlbNew<Mutex>();
+    m_heapinfo = mlbNew<HeapTable>();
+    m_counter = mlbNew<CountTable>();
+    m_modules = mlbNew<StringCont>();
+    m_ignores = mlbNew<StringCont>();
+    loadConfig();
+    InitializeDebugSymbol();
+    HookHeapAlloc(*m_modules);
+}
+
+MemoryLeakBuster::~MemoryLeakBuster()
+{
+    if (!m_mutex)
+        return;
+    Mutex::ScopedLock l(*m_mutex);
+
+    UnhookHeapAlloc(*m_modules);
+    printLeakInfo();
+
+    // 解放後もアクセスされる可能性がある点に注意
+    // 全チェックを無効化して他のメンバ変数にアクセスされないようにする
+    m_flags.i = 0;
+    mlbDelete(m_ignores);  m_ignores = nullptr;
+    mlbDelete(m_modules);  m_modules = nullptr;
+    mlbDelete(m_counter);  m_counter = nullptr;
+    mlbDelete(m_heapinfo); m_heapinfo = nullptr;
+
+    // m_mutex は開放しない
+    // 別スレッドから HeapFree_Hooked() が呼ばれて mutex を待ってる間に
+    // ここでその mutex を破棄してしまうとクラッシュしてしまうため
+
+    enbaleFileOutput(false);
+    FinalizeDebugSymbol();
+}
+
+bool MemoryLeakBuster::loadConfig()
+{
+    for (auto* mod : g_target_modules)
+        m_modules->push_back(mod);
+
+    for (auto* pattern : g_ignore_list)
+        m_ignores->push_back(pattern);
+
+    char buf[256];
+    if (FILE* f = fopen("mlbConfig.txt", "r")) {
+        int i;
+        char s[128]{};
+        while (fgets(buf, (int)std::size(buf), f)) {
+            if (sscanf(buf, "disable: %d", &i) == 1) { m_flags.enable_leakcheck = (i != 1); }
+            else if (sscanf(buf, "fileoutput: %d", &i) == 1) { enbaleFileOutput(i != 0); }
+            else if (sscanf(buf, "ignore: \"%[^\"]\"", s) == 1) { m_ignores->push_back(s); }
+            else if (sscanf(buf, "module: \"%[^\"]\"", s) == 1) { m_modules->push_back(s); }
+        }
+        fclose(f);
+        return true;
+    }
+    return false;
+}
+
+void MemoryLeakBuster::enbaleFileOutput(bool v)
+{
+    if (v && !m_logfile) {
+        m_logfile = fopen("mlbLog.txt", "wb");
+    }
+    else if (!v && m_logfile) {
+        fclose(m_logfile);
+        m_logfile = nullptr;
+    }
+}
+
+void MemoryLeakBuster::addHeapInfo(void* p, size_t size)
+{
+    if (!p || m_flags.i == 0)
+        return;
+
+    HeapInfo cs;
+    cs.address = p;
+    cs.size = size;
+    cs.time = mlbNow();
+    cs.callstack_size = GetCallstack(cs.callstack);
+    cs.count = 0;
+    {
+        Mutex::ScopedLock l(*m_mutex);
+        if (m_flags.enable_leakcheck || m_flags.enable_scopedcheck) {
+            cs.id = ++m_idgen;
+            (*m_heapinfo)[p] = cs;
+        }
+        if (m_flags.enable_counter) {
+            auto r = m_counter->insert(cs);
+            const_cast<HeapInfo&>(*r.first).count++;
+        }
+    }
+}
+
+void MemoryLeakBuster::eraseHeapInfo(void* p)
+{
+    if (!p || (m_flags.enable_leakcheck == 0 && m_flags.enable_scopedcheck == 0))
+        return;
+    Mutex::ScopedLock l(*m_mutex);
+    if (m_heapinfo)
+        m_heapinfo->erase(p);
+}
+
+// lock しない。内部実装用
+MemoryLeakBuster::HeapTable::const_iterator MemoryLeakBuster::_findHeapInfo(void* p) const
+{
+    if (m_heapinfo->empty())
+        return m_heapinfo->end();
+
+    auto i = m_heapinfo->lower_bound(p);
+    if (i == m_heapinfo->end() || (p != i->first && i != m_heapinfo->begin()))
+        --i;
+
+    auto& hi = i->second;
+    if (p >= hi.address && p <= (void*)((size_t)hi.address + hi.size))
+        return i;
+    return m_heapinfo->end();
+}
+
+const MemoryLeakBuster::HeapInfo* MemoryLeakBuster::getHeapInfo(void* p)
+{
+    Mutex::ScopedLock l(*m_mutex);
+    if (!m_heapinfo)
+        return nullptr;
+
+    auto i = _findHeapInfo(p);
+    if (i == m_heapinfo->end())
+        return nullptr;
+    return &i->second;
+}
+
+void MemoryLeakBuster::inspect(void* p) const
+{
+    if (IsStaticMemory(p)) {
+        ::OutputDebugStringA("static memory\n");
+        return;
+    }
+    if (IsStackMemory(p)) {
+        ::OutputDebugStringA("stack memory\n");
+        return;
+    }
+
+    const HeapInfo* r = nullptr;
+    const void* neighbor[2] = { nullptr, nullptr };
+    {
+        Mutex::ScopedLock l(*m_mutex);
+        if (!m_heapinfo)
+            return;
+
+        auto li = _findHeapInfo(p);
+        if (li != m_heapinfo->end()) {
+            const HeapInfo& ai = li->second;
+            r = &ai;
+            if (li != m_heapinfo->begin()) {
+                auto prev = li; --prev;
+                neighbor[0] = prev->second.address;
+            }
+            {
+                auto next = li; ++next;
+                if (next != m_heapinfo->end()) {
+                    neighbor[1] = next->second.address;
+                }
+            }
+        }
+    }
+
+    if (!r) {
+        ::OutputDebugStringA("no information.\n");
+        return;
+    }
+    char buf[128];
+    TempString text, bufstr;
+    text.reserve(1024 * 16);
+    snprintf(buf, std::size(buf), "0x%p (%zu byte) ", r->address, r->size); text += buf;
+    snprintf(buf, std::size(buf), "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text += buf;
+    CallstackToSymbolNamesStripped(text, r->callstack, r->callstack_size, bufstr);
+    ::OutputDebugStringA(text.c_str());
+}
+
+void MemoryLeakBuster::printLeakInfo() const
+{
+    Mutex::ScopedLock l(*m_mutex);
+    if (!m_heapinfo)
+        return;
+
+    char buf[128];
+    TempString text, bufstr;
+    text.reserve(1024 * 16);
+    for (auto& kvp : *m_heapinfo) {
+        const auto& ai = kvp.second;
+
+        text.clear();
+        snprintf(buf, std::size(buf), "memory leak: 0x%p (%zu byte)\n", ai.address, ai.size);
+        text += buf;
+        CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
+        text += "\n";
+        if (!shouldBeIgnored(text)) {
+            output(text.c_str(), text.size());
+        }
+    }
+}
+
+
+void MemoryLeakBuster::beginScope()
+{
+    Mutex::ScopedLock l(*m_mutex);
+    m_flags.enable_scopedcheck = 1;
+    m_scope = m_idgen;
+}
+
+void MemoryLeakBuster::endScope()
+{
+    Mutex::ScopedLock l(*m_mutex);
+    if (!m_heapinfo)
+        return;
+
+    char buf[128];
+    TempString text, bufstr;
+    text.reserve(1024 * 16);
+    for (auto& kvp : *m_heapinfo) {
+        const auto& ai = kvp.second;
+        if (ai.id < m_scope)
+            continue;
+
+        text.clear();
+        snprintf(buf, std::size(buf), "maybe a leak: 0x%p (%zu byte)\n", ai.address, ai.size);
+        text += buf;
+        CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
+        text += "\n";
+        if (!shouldBeIgnored(text)) {
+            output(text.c_str(), text.size());
+        }
+    }
+    m_scope = INT_MAX;
+    m_flags.enable_scopedcheck = 0;
+}
+
+
+void MemoryLeakBuster::beginCount()
+{
+    Mutex::ScopedLock l(*m_mutex);
+    m_flags.enable_counter = 1;
+}
+
+void MemoryLeakBuster::endCount()
+{
+    Mutex::ScopedLock l(*m_mutex);
+    if (!m_flags.enable_counter)
+        return;
+
+    int total = 0;
+    char buf[128];
+    TempString text, bufstr;
+    text.reserve(1024 * 16);
+    for (auto& kvp : *m_heapinfo) {
+        const auto& ai = kvp.second;
+
+        text.clear();
+        snprintf(buf, std::size(buf), "%d times from\n", ai.count);
+        text += buf;
+        CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
+        text += "\n";
+        output(text.c_str(), text.size());
+        total += ai.count;
+    }
+    snprintf(buf, std::size(buf), "total %d times\n", total);
+    output(buf);
+
+    m_flags.enable_counter = 0;
+}
+
+
+bool MemoryLeakBuster::shouldBeIgnored(const TempString& callstack) const
+{
+    for (auto& ignore : *m_ignores) {
+        if (callstack.find(ignore.c_str()) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MemoryLeakBuster::output(const char* str, size_t len) const
+{
+    if (m_logfile) {
+        if (len == 0)
+            len = strlen(str);
+        fwrite(str, 1, len, m_logfile);
+    }
+    else {
+        ::OutputDebugStringA(str);
+    }
+}
 
 static MemoryLeakBuster *g_mlb;
 
