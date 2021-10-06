@@ -53,6 +53,11 @@ const size_t MaxCallstackDepth = 64;
 // EnumProcessModules でロードされている全モジュールに仕掛けることもできるが、色々誤判定されるので絞ったほうがいいと思われる。
 // /MT や /MTd でビルドされたモジュールのリークチェックをしたい場合、このリストに対象モジュールを書けばいけるはず。
 const char *g_target_modules[] = {
+    "msvcp140.dll",
+    "msvcp140d.dll",
+    "vcruntime140.dll",
+    "vcruntime140d.dll",
+
     "msvcr120.dll",
     "msvcr120d.dll",
     "msvcr110.dll",
@@ -90,29 +95,38 @@ const char *g_ignore_list[] = {
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
 
+#define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 #include <string>
 #include <vector>
 #include <map>
 #include <set>
 #include <algorithm>
+#include <cinttypes>
 #define mlbForceLink   __declspec(dllexport)
+
+#ifdef _M_X64
+    #define fHex "llx"
+#else
+    #define fHex "x"
+#endif
 
 namespace mlb {
 
-typedef unsigned int        uint32;
-typedef unsigned long long  uint64;
-typedef LPVOID (WINAPI *HeapAllocT)( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
-typedef LPVOID (WINAPI *HeapReAllocT)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
-typedef BOOL (WINAPI *HeapFreeT)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
+using uint32 = unsigned int;
+using uint64 = unsigned long long;
+using HeapAllocT = LPVOID (WINAPI *)( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
+using HeapReAllocT = LPVOID (WINAPI *)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
+using HeapFreeT = BOOL (WINAPI *)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
 
 // 乗っ取り前の HeapAlloc/Free
-HeapAllocT      HeapAlloc_Orig  = NULL;
-HeapReAllocT    HeapReAlloc_Orig= NULL;
-HeapFreeT       HeapFree_Orig   = NULL;
+HeapAllocT      HeapAlloc_Orig = nullptr;
+HeapReAllocT    HeapReAlloc_Orig = nullptr;
+HeapFreeT       HeapFree_Orig = nullptr;
 
 // 乗っ取り後の HeapAlloc/Free
 LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
@@ -129,15 +143,15 @@ template<class T> T* mlbNew()
 
 template<class T> void mlbDelete(T *v)
 {
-    if(v!=NULL) {
+    if (v) {
         v->~T();
         mlbFree(v);
     }
 }
 
-bool InitializeDebugSymbol(HANDLE proc=::GetCurrentProcess())
+bool InitializeDebugSymbol(HANDLE proc = ::GetCurrentProcess())
 {
-    if(!::SymInitialize(proc, NULL, TRUE)) {
+    if(!::SymInitialize(proc, nullptr, TRUE)) {
         return false;
     }
     ::SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
@@ -165,19 +179,19 @@ bool IsStaticMemory(void *addr)
 
 // 指定アドレスが現在のスレッドの stack 領域内であれば true
 // * 現在のスレッドの stack しか判別できません
-bool IsStackMemory(void *addr)
+bool IsStackMemory(void* addr)
 {
     NT_TIB *tib = reinterpret_cast<NT_TIB*>(::NtCurrentTeb());
     return addr>=tib->StackLimit && addr<tib->StackBase;
 }
 
-int GetCallstack(void **callstack, int callstack_size)
+int GetCallstack(void **callstack, size_t callstack_size)
 {
-    return CaptureStackBackTrace(1, callstack_size, callstack, NULL);
+    return CaptureStackBackTrace(1, (DWORD)callstack_size, callstack, nullptr);
 }
 
 template<class String>
-void AddressToSymbolName(String &out_text, void *address, HANDLE proc=::GetCurrentProcess())
+void AddressToSymbolName(String& out_text, void* address, HANDLE proc = ::GetCurrentProcess())
 {
 #ifdef _WIN64
     typedef DWORD64 DWORDX;
@@ -190,7 +204,7 @@ void AddressToSymbolName(String &out_text, void *address, HANDLE proc=::GetCurre
     char buf[2048];
     HANDLE process = proc;
     IMAGEHLP_MODULE imageModule = { sizeof(IMAGEHLP_MODULE) };
-    IMAGEHLP_LINE line ={sizeof(IMAGEHLP_LINE)};
+    IMAGEHLP_LINE line = { sizeof(IMAGEHLP_LINE) };
     DWORDX dispSym = 0;
     DWORD dispLine = 0;
 
@@ -200,23 +214,23 @@ void AddressToSymbolName(String &out_text, void *address, HANDLE proc=::GetCurre
     imageSymbol->MaxNameLength = MAX_PATH;
 
     if(!::SymGetModuleInfo(process, (DWORDX)address, &imageModule)) {
-        sprintf_s(buf, "[0x%p]\n", address);
+        snprintf(buf, std::size(buf), "[0x%p]\n", address);
     }
     else if(!::SymGetSymFromAddr(process, (DWORDX)address, &dispSym, imageSymbol)) {
-        sprintf_s(buf, "%s + 0x%x [0x%p]\n", imageModule.ModuleName, ((size_t)address-(size_t)imageModule.BaseOfImage), address);
+        snprintf(buf, std::size(buf), "%s + 0x%" fHex " [0x%p]\n", imageModule.ModuleName, ((size_t)address-(size_t)imageModule.BaseOfImage), address);
     }
     else if(!::SymGetLineFromAddr(process, (DWORDX)address, &dispLine, &line)) {
-        sprintf_s(buf, "%s!%s + 0x%x [0x%p]\n", imageModule.ModuleName, imageSymbol->Name, ((size_t)address-(size_t)imageSymbol->Address), address);
+        snprintf(buf, std::size(buf), "%s!%s + 0x%" fHex " [0x%p]\n", imageModule.ModuleName, imageSymbol->Name, ((size_t)address-(size_t)imageSymbol->Address), address);
     }
     else {
-        sprintf_s(buf, "%s(%d): %s!%s + 0x%x [0x%p]\n", line.FileName, line.LineNumber,
+        snprintf(buf, std::size(buf), "%s(%d): %s!%s + 0x%" fHex " [0x%p]\n", line.FileName, line.LineNumber,
             imageModule.ModuleName, imageSymbol->Name, ((size_t)address-(size_t)imageSymbol->Address), address);
     }
     out_text += buf;
 }
 
 template<class String>
-void CallstackToSymbolNames_Stripped(String &out_text, void * const *callstack, int callstack_size, String &buf)
+void CallstackToSymbolNames_Stripped(String& out_text, void* const* callstack, int callstack_size, String& buf)
 {
     buf.clear();
     for(int i=0; i<callstack_size; ++i) {
@@ -227,24 +241,24 @@ void CallstackToSymbolNames_Stripped(String &out_text, void * const *callstack, 
     size_t end = buf.size();
     {
         size_t pos = buf.find("!aligned_malloc ");
-        if(pos==String::npos) { pos = buf.find("!malloc "); }
-        if(pos!=String::npos) {
-            for(;;) {
-                if(buf[++pos]=='\n') { begin = ++pos; break;}
+        if (pos == String::npos) { pos = buf.find("!malloc "); }
+        if (pos != String::npos) {
+            for (;;) {
+                if (buf[++pos] == '\n') { begin = ++pos; break; }
             }
         }
     }
     {
         size_t pos = buf.find("!__tmainCRTStartup ", begin);
-        if(pos==String::npos) { pos = buf.find("!endthreadex ", begin); }
-        if(pos==String::npos) { pos = buf.find("!BaseThreadInitThunk ", begin); }
-        if(pos!=String::npos) {
-            for(;;) {
-                if(buf[--pos]=='\n') { end = ++pos; break;}
+        if (pos == String::npos) { pos = buf.find("!endthreadex ", begin); }
+        if (pos == String::npos) { pos = buf.find("!BaseThreadInitThunk ", begin); }
+        if (pos != String::npos) {
+            for (;;) {
+                if (buf[--pos] == '\n') { end = ++pos; break; }
             }
         }
     }
-    out_text.insert(out_text.end(), buf.begin()+begin, buf.begin()+end);
+    out_text.insert(out_text.end(), buf.begin() + begin, buf.begin() + end);
 }
 
 
@@ -254,6 +268,7 @@ class ScopedLock
 public:
     ScopedLock(T &m) : m_mutex(m) { m_mutex.lock(); }
     ~ScopedLock() { m_mutex.unlock(); }
+
 private:
     T &m_mutex;
 };
@@ -261,26 +276,21 @@ private:
 class Mutex
 {
 public:
-    typedef ScopedLock<Mutex> ScopedLock;
-    typedef CRITICAL_SECTION Handle;
+    using ScopedLock = ScopedLock<Mutex>;
+    using Handle = CRITICAL_SECTION;
 
-    Mutex()          { InitializeCriticalSection(&m_lockobj); }
-    ~Mutex()         { DeleteCriticalSection(&m_lockobj); }
-    void lock()      { EnterCriticalSection(&m_lockobj); }
-    bool tryLock()   { return TryEnterCriticalSection(&m_lockobj)==TRUE; }
-    void unlock()    { LeaveCriticalSection(&m_lockobj); }
+    Mutex(const Mutex&) = delete;
+    Mutex& operator=(const Mutex&) = delete;
 
-    Handle getHandle() const { return m_lockobj; }
+    Mutex()        { ::InitializeCriticalSection(&m_lockobj); }
+    ~Mutex()       { ::DeleteCriticalSection(&m_lockobj); }
+    void lock()    { ::EnterCriticalSection(&m_lockobj); }
+    bool tryLock() { return ::TryEnterCriticalSection(&m_lockobj) == TRUE; }
+    void unlock()  { ::LeaveCriticalSection(&m_lockobj); }
 
 private:
     Handle m_lockobj;
-    Mutex(const Mutex&);
-    Mutex& operator=(const Mutex&);
 };
-
-#ifdef max
-#   undef max
-#endif// max
 
 // アロケーション情報を格納するコンテナのアロケータが new / delete を使うと永久再起するので、
 // hook を通さないメモリ確保を行うアロケータを用意
@@ -320,8 +330,8 @@ public :
 template<class T, typename Alloc> inline bool operator==(const OrigHeapAllocator<T>& l, const OrigHeapAllocator<T>& r) { return (l.equals(r)); }
 template<class T, typename Alloc> inline bool operator!=(const OrigHeapAllocator<T>& l, const OrigHeapAllocator<T>& r) { return (!(l == r)); }
 
-typedef std::basic_string<char, std::char_traits<char>, OrigHeapAllocator<char> > TempString;
-typedef std::vector<TempString, OrigHeapAllocator<TempString> > StringCont;
+using TempString = std::basic_string<char, std::char_traits<char>, OrigHeapAllocator<char> >;
+using StringCont = std::vector<TempString, OrigHeapAllocator<TempString> >;
 
 
 
@@ -341,24 +351,28 @@ template<class T> inline void ForceWrite(T &dst, const T &src)
 template<class F>
 bool EachImportFunction(HMODULE module, const char *dllname, const F &f)
 {
-    if(module==0) { return false; }
+    if (!module)
+        return false;
 
     size_t ImageBase = (size_t)module;
     PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)ImageBase;
-    if(pDosHeader->e_magic!=IMAGE_DOS_SIGNATURE) { return false; }
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+
     PIMAGE_NT_HEADERS pNTHeader = (PIMAGE_NT_HEADERS)(ImageBase + pDosHeader->e_lfanew);
-
     size_t RVAImports = pNTHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if(RVAImports==0) { return false; }
+    if (RVAImports == 0)
+        return false;
 
-    IMAGE_IMPORT_DESCRIPTOR *pImportDesc = (IMAGE_IMPORT_DESCRIPTOR*)(ImageBase + RVAImports);
-    while(pImportDesc->Name != 0) {
-        if(stricmp((const char*)(ImageBase+pImportDesc->Name), dllname)==0) {
-            IMAGE_IMPORT_BY_NAME **func_names = (IMAGE_IMPORT_BY_NAME**)(ImageBase+pImportDesc->Characteristics);
-            void **import_table = (void**)(ImageBase+pImportDesc->FirstThunk);
-            for(size_t i=0; ; ++i) {
-                if((size_t)func_names[i] == 0) { break;}
-                const char *funcname = (const char*)(ImageBase+(size_t)func_names[i]->Name);
+    IMAGE_IMPORT_DESCRIPTOR* pImportDesc = (IMAGE_IMPORT_DESCRIPTOR*)(ImageBase + RVAImports);
+    while (pImportDesc->Name != 0) {
+        if (stricmp((const char*)(ImageBase + pImportDesc->Name), dllname) == 0) {
+            IMAGE_IMPORT_BY_NAME** func_names = (IMAGE_IMPORT_BY_NAME**)(ImageBase + pImportDesc->Characteristics);
+            void** import_table = (void**)(ImageBase + pImportDesc->FirstThunk);
+            for (size_t i = 0; ; ++i) {
+                if ((size_t)func_names[i] == 0)
+                    break;
+                auto* funcname = (const char*)(ImageBase + (size_t)func_names[i]->Name);
                 f(funcname, import_table[i]);
             }
         }
@@ -372,12 +386,11 @@ void EachImportFunctionInEveryModule(const char *dllname, const F &f)
 {
     std::vector<HMODULE> modules;
     DWORD num_modules;
-    ::EnumProcessModules(::GetCurrentProcess(), NULL, 0, &num_modules);
-    modules.resize(num_modules/sizeof(HMODULE));
+    ::EnumProcessModules(::GetCurrentProcess(), nullptr, 0, &num_modules);
+    modules.resize(num_modules / sizeof(HMODULE));
     ::EnumProcessModules(::GetCurrentProcess(), &modules[0], num_modules, &num_modules);
-    for(size_t i=0; i<modules.size(); ++i) {
-        EachImportFunction<F>(modules[i], dllname, f);
-    }
+    for (auto& mod : modules)
+        EachImportFunction<F>(mod, dllname, f);
 }
 
 void SaveOrigHeapAlloc()
@@ -389,41 +402,45 @@ void SaveOrigHeapAlloc()
 
 void HookHeapAlloc(const char *modulename)
 {
-    EachImportFunction(::GetModuleHandleA(modulename), "kernel32.dll", [](const char *funcname, void *&func){
-        if(strcmp(funcname, "HeapAlloc")==0) {
+    auto do_hook = [](const char* funcname, void*& func) {
+        if (strcmp(funcname, "HeapAlloc") == 0) {
             ForceWrite<void*>(func, HeapAlloc_Hooked);
         }
-        else if(strcmp(funcname, "HeapReAlloc")==0) {
+        else if (strcmp(funcname, "HeapReAlloc") == 0) {
             ForceWrite<void*>(func, HeapReAlloc_Hooked);
         }
-        else if(strcmp(funcname, "HeapFree")==0) {
+        else if (strcmp(funcname, "HeapFree") == 0) {
             ForceWrite<void*>(func, HeapFree_Hooked);
         }
-    });
+    };
+
+    EachImportFunction(::GetModuleHandleA(modulename), "kernel32.dll", do_hook);
 }
 
 void HookHeapAlloc(const StringCont &modules)
 {
-    HookHeapAlloc(nullptr);
-    for(size_t i=0; i<modules.size(); ++i) {
-        HookHeapAlloc(modules[i].c_str());
+    HookHeapAlloc(nullptr); // exe を hook
+    for (auto& mod : modules) {
+        HookHeapAlloc(mod.c_str());
     }
 }
 
 void UnhookHeapAlloc(const StringCont &modules)
 {
-    for(size_t i=0; i<modules.size(); ++i) {
-        EachImportFunction(::GetModuleHandleA(modules[i].c_str()), "kernel32.dll", [](const char *funcname, void *&func){
-            if(strcmp(funcname, "HeapAlloc")==0) {
-                ForceWrite<void*>(func, HeapAlloc_Orig);
-            }
-            else if(strcmp(funcname, "HeapReAlloc")==0) {
-                ForceWrite<void*>(func, HeapReAlloc_Orig);
-            }
-            else if(strcmp(funcname, "HeapFree")==0) {
-                ForceWrite<void*>(func, HeapFree_Orig);
-            }
-        });
+    auto do_unhook = [](const char* funcname, void*& func) {
+        if (strcmp(funcname, "HeapAlloc") == 0) {
+            ForceWrite<void*>(func, HeapAlloc_Orig);
+        }
+        else if (strcmp(funcname, "HeapReAlloc") == 0) {
+            ForceWrite<void*>(func, HeapReAlloc_Orig);
+        }
+        else if (strcmp(funcname, "HeapFree") == 0) {
+            ForceWrite<void*>(func, HeapFree_Orig);
+        }
+    };
+
+    for (auto& mod : modules) {
+        EachImportFunction(::GetModuleHandleA(mod.c_str()), "kernel32.dll", do_unhook);
     }
 }
 
@@ -432,27 +449,29 @@ class MemoryLeakBuster
 public:
     struct HeapInfo
     {
-        void *address;
-        size_t size;
-        void *callstack[MaxCallstackDepth];
-        uint32 callstack_size;
-        uint32 id;
-        uint32 count;
+        void *address = nullptr;
+        size_t size = 0;
+        void* callstack[MaxCallstackDepth]{};
+        uint32 callstack_size = 0;
+        uint32 id = 0;
+        uint32 count = 0;
     };
+
     struct less_callstack
     {
         bool operator()(const HeapInfo &a, const HeapInfo &b) const
         {
-            if(a.callstack_size==b.callstack_size) {
-                return memcmp(a.callstack, b.callstack, sizeof(void*)*a.callstack_size)<0;
+            if (a.callstack_size == b.callstack_size) {
+                return memcmp(a.callstack, b.callstack, sizeof(void*) * a.callstack_size) < 0;
             }
             else {
                 return a.callstack_size < b.callstack_size;
             }
         };
     };
-    typedef std::map<void*, HeapInfo, std::less<void*>, OrigHeapAllocator<std::pair<const void*, HeapInfo> > > HeapTable;
-    typedef std::set<HeapInfo, less_callstack, OrigHeapAllocator<HeapInfo> > CountTable;
+    using HeapTable = std::map<void*, HeapInfo, std::less<void*>, OrigHeapAllocator<std::pair<const void*, HeapInfo> > >;
+    using CountTable = std::set<HeapInfo, less_callstack, OrigHeapAllocator<HeapInfo> >;
+
     union Flags
     {
         struct {
@@ -464,14 +483,6 @@ public:
     };
 
     MemoryLeakBuster()
-        : m_logfile(NULL)
-        , m_mutex(NULL)
-        , m_heapinfo(NULL)
-        , m_counter(NULL)
-        , m_modules(NULL)
-        , m_ignores(NULL)
-        , m_idgen(0)
-        , m_scope(INT_MAX)
     {
         SaveOrigHeapAlloc();
         m_flags.i = 0;
@@ -488,7 +499,8 @@ public:
 
     ~MemoryLeakBuster()
     {
-        if(!m_mutex) { return; }
+        if (!m_mutex)
+            return;
         Mutex::ScopedLock l(*m_mutex);
 
         printLeakInfo();
@@ -512,22 +524,20 @@ public:
 
     bool loadConfig()
     {
-        for(size_t i=0; i<_countof(g_target_modules); ++i) {
+        for (size_t i = 0; i < std::size(g_target_modules); ++i)
             m_modules->push_back(g_target_modules[i]);
-        }
-        for(size_t i=0; i<_countof(g_ignore_list); ++i) {
+        for (size_t i = 0; i < std::size(g_ignore_list); ++i)
             m_ignores->push_back(g_ignore_list[i]);
-        }
 
         char buf[256];
-        if(FILE *f=fopen("mlbConfig.txt", "r")) {
+        if (FILE* f = fopen("mlbConfig.txt", "r")) {
             int i;
             char s[128];
-            while(fgets(buf, _countof(buf), f)) {
-                if     (sscanf(buf, "disable: %d", &i)==1)        { m_flags.enable_leakcheck=(i!=1); }
-                else if(sscanf(buf, "fileoutput: %d", &i)==1)     { enbaleFileOutput(i!=0); }
-                else if(sscanf(buf, "ignore: \"%[^\"]\"", s)==1)  { m_ignores->push_back(s); }
-                else if(sscanf(buf, "module: \"%[^\"]\"", s)==1)  { m_modules->push_back(s); }
+            while (fgets(buf, (int)std::size(buf), f)) {
+                if (sscanf(buf, "disable: %d", &i) == 1) { m_flags.enable_leakcheck = (i != 1); }
+                else if (sscanf(buf, "fileoutput: %d", &i) == 1) { enbaleFileOutput(i != 0); }
+                else if (sscanf(buf, "ignore: \"%[^\"]\"", s) == 1) { m_ignores->push_back(s); }
+                else if (sscanf(buf, "module: \"%[^\"]\"", s) == 1) { m_modules->push_back(s); }
             }
             fclose(f);
             return true;
@@ -537,23 +547,24 @@ public:
 
     void enbaleFileOutput(bool v)
     {
-        if(v && m_logfile==NULL) {
+        if (v && !m_logfile) {
             m_logfile = fopen("mlbLog.txt", "wb");
         }
-        else if(!v && m_logfile!=NULL) {
+        else if (!v && m_logfile) {
             fclose(m_logfile);
-            m_logfile = NULL;
+            m_logfile = nullptr;
         }
     }
 
     void addHeapInfo(void *p, size_t size)
     {
-        if(p==NULL || m_flags.i==0) { return; }
+        if (!p || m_flags.i == 0)
+            return;
 
         HeapInfo cs;
         cs.address = p;
         cs.size = size;
-        cs.callstack_size = GetCallstack(cs.callstack, _countof(cs.callstack));
+        cs.callstack_size = GetCallstack(cs.callstack, std::size(cs.callstack));
         cs.count = 0;
         {
             Mutex::ScopedLock l(*m_mutex);
@@ -570,46 +581,59 @@ public:
 
     void eraseHeapInfo(void *p)
     {
-        if(p==NULL || (m_flags.enable_leakcheck==0 && m_flags.enable_scopedcheck==0)) { return; }
+        if (!p || (m_flags.enable_leakcheck == 0 && m_flags.enable_scopedcheck == 0))
+            return;
         Mutex::ScopedLock l(*m_mutex);
-        if(m_heapinfo!=NULL) {
+        if (m_heapinfo)
             m_heapinfo->erase(p);
-        }
     }
 
     // lock しない。内部実装用
     HeapTable::const_iterator _findHeapInfo(void *p) const
     {
-        if(m_heapinfo->empty()) { return m_heapinfo->end(); }
-        HeapTable::const_iterator i = m_heapinfo->lower_bound(p);
-        if(i==m_heapinfo->end() || (p!=i->first && i!=m_heapinfo->begin())) { --i; }
+        if (m_heapinfo->empty())
+            return m_heapinfo->end();
 
-        const HeapInfo &hi = i->second;
-        if(p>=hi.address && p<=(void*)((size_t)hi.address+hi.size)) {
+        auto i = m_heapinfo->lower_bound(p);
+        if (i == m_heapinfo->end() || (p != i->first && i != m_heapinfo->begin()))
+            --i;
+
+        auto& hi = i->second;
+        if (p >= hi.address && p <= (void*)((size_t)hi.address + hi.size))
             return i;
-        }
         return m_heapinfo->end();
     }
 
     const HeapInfo* getHeapInfo(void *p)
     {
         Mutex::ScopedLock l(*m_mutex);
-        if(m_heapinfo==NULL) { return NULL; }
+        if (!m_heapinfo)
+            return nullptr;
+
         auto i = _findHeapInfo(p);
-        if(i==m_heapinfo->end()) { return NULL; }
+        if (i == m_heapinfo->end())
+            return nullptr;
         return &i->second;
     }
 
     void inspect(void *p) const
     {
-        if(IsStaticMemory(p)) { OutputDebugStringA("static memory\n"); return; }
-        if(IsStackMemory(p))  { OutputDebugStringA("stack memory\n");  return; }
+        if (IsStaticMemory(p)) {
+            ::OutputDebugStringA("static memory\n");
+            return;
+        }
+        if (IsStackMemory(p)) {
+            ::OutputDebugStringA("stack memory\n");
+            return;
+        }
 
-        const HeapInfo *r = NULL;
-        const void *neighbor[2] = {NULL, NULL};
+        const HeapInfo *r = nullptr;
+        const void *neighbor[2] = { nullptr, nullptr };
         {
             Mutex::ScopedLock l(*m_mutex);
-            if(m_heapinfo==NULL) { return; }
+            if (!m_heapinfo)
+                return;
+
             auto li = _findHeapInfo(p);
             if(li!=m_heapinfo->end()) {
                 const HeapInfo &ai = li->second;
@@ -627,36 +651,37 @@ public:
             }
         }
 
-        if(r==NULL) {
-            OutputDebugStringA("no information.\n");
+        if (!r) {
+            ::OutputDebugStringA("no information.\n");
             return;
         }
         char buf[128];
         TempString text, bufstr;
         text.reserve(1024*16);
-        sprintf_s(buf, "0x%p (%llu byte) ", r->address, (uint64)r->size); text+=buf;
-        sprintf_s(buf, "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text+=buf;
+        snprintf(buf, std::size(buf), "0x%p (%llu byte) ", r->address, (uint64)r->size); text+=buf;
+        snprintf(buf, std::size(buf), "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text+=buf;
         CallstackToSymbolNames_Stripped(text, r->callstack, r->callstack_size, bufstr);
-        OutputDebugStringA(text.c_str());
+        ::OutputDebugStringA(text.c_str());
     }
 
     void printLeakInfo() const
     {
         Mutex::ScopedLock l(*m_mutex);
-        if(m_heapinfo==NULL) { return; }
+        if (!m_heapinfo)
+            return;
 
         char buf[128];
         TempString text, bufstr;
         text.reserve(1024*16);
-        for(auto li=m_heapinfo->begin(); li!=m_heapinfo->end(); ++li) {
-            const HeapInfo &ai = li->second;
+        for (auto& kvp : *m_heapinfo) {
+            const auto& ai = kvp.second;
 
             text.clear();
-            sprintf_s(buf, "memory leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
+            snprintf(buf, std::size(buf), "memory leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
             text += buf;
             CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
-            if(!shouldBeIgnored(text)) {
+            if (!shouldBeIgnored(text)) {
                 output(text.c_str(), text.size());
             }
         }
@@ -673,17 +698,19 @@ public:
     void endScope()
     {
         Mutex::ScopedLock l(*m_mutex);
-        if(m_heapinfo==NULL) { return; }
+        if (!m_heapinfo)
+            return;
 
         char buf[128];
         TempString text, bufstr;
         text.reserve(1024*16);
-        for(auto li=m_heapinfo->begin(); li!=m_heapinfo->end(); ++li) {
-            const HeapInfo &ai = li->second;
-            if(ai.id<m_scope) { continue; }
+        for (auto& kvp : *m_heapinfo) {
+            const auto& ai = kvp.second;
+            if (ai.id < m_scope)
+                continue;
 
             text.clear();
-            sprintf_s(buf, "maybe a leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
+            snprintf(buf, std::size(buf), "maybe a leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
             text += buf;
             CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
@@ -705,24 +732,25 @@ public:
     void endCount()
     {
         Mutex::ScopedLock l(*m_mutex);
-        if(!m_flags.enable_counter) { return; }
+        if (!m_flags.enable_counter)
+            return;
 
         int total = 0;
         char buf[128];
         TempString text, bufstr;
         text.reserve(1024*16);
-        for(auto li=m_counter->begin(); li!=m_counter->end(); ++li) {
-            const HeapInfo &ai = *li;
+        for (auto& kvp : *m_heapinfo) {
+            const auto& ai = kvp.second;
 
             text.clear();
-            sprintf_s(buf, "%d times from\n", ai.count);
+            snprintf(buf, std::size(buf), "%d times from\n", ai.count);
             text += buf;
             CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             output(text.c_str(), text.size());
             total += ai.count;
         }
-        sprintf_s(buf, "total %d times\n", total);
+        snprintf(buf, std::size(buf), "total %d times\n", total);
         output(buf);
 
         m_flags.enable_counter = 0;
@@ -731,8 +759,8 @@ public:
 
     bool shouldBeIgnored(const TempString &callstack) const
     {
-        for(size_t i=0; i<m_ignores->size(); ++i) {
-            if(callstack.find((*m_ignores)[i].c_str())!=std::string::npos) {
+        for (auto& ignore : *m_ignores) {
+            if (callstack.find(ignore.c_str()) != std::string::npos) {
                 return true;
             }
         }
@@ -741,37 +769,38 @@ public:
 
     void output(const char *str, size_t len=0) const
     {
-        if(m_logfile) {
-            if(len==0) { len=strlen(str); }
+        if (m_logfile) {
+            if (len == 0)
+                len = strlen(str);
             fwrite(str, 1, len, m_logfile);
         }
         else {
-            OutputDebugStringA(str);
+            ::OutputDebugStringA(str);
         }
     }
 
 private:
-    FILE *m_logfile;
-    Mutex *m_mutex;
-    HeapTable *m_heapinfo;
-    CountTable *m_counter;
-    StringCont *m_modules;
-    StringCont *m_ignores;
-    uint32 m_idgen;
-    uint32 m_scope;
-    Flags m_flags;
+    FILE *m_logfile = nullptr;
+    Mutex *m_mutex = nullptr;
+    HeapTable *m_heapinfo = nullptr;
+    CountTable *m_counter = nullptr;
+    StringCont *m_modules = nullptr;
+    StringCont *m_ignores = nullptr;
+    uint32 m_idgen = 0;
+    uint32 m_scope = INT_MAX;
+    Flags m_flags{};
 };
 
 MemoryLeakBuster *g_mlb;
 
-LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes )
+LPVOID WINAPI HeapAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 {
     LPVOID p = HeapAlloc_Orig(hHeap, dwFlags, dwBytes);
     g_mlb->addHeapInfo(p, dwBytes);
     return p;
 }
 
-LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes )
+LPVOID WINAPI HeapReAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes)
 {
     g_mlb->eraseHeapInfo(lpMem);
     LPVOID p = HeapReAlloc_Orig(hHeap, dwFlags, lpMem, dwBytes);
@@ -779,7 +808,7 @@ LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZ
     return p;
 }
 
-BOOL WINAPI HeapFree_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem )
+BOOL WINAPI HeapFree_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem)
 {
     BOOL r = HeapFree_Orig(hHeap, dwFlags, lpMem);
     g_mlb->eraseHeapInfo(lpMem);
@@ -792,7 +821,7 @@ using namespace mlb;
 
 
 // イミディエイトウィンドウから実行可能な関数群
-typedef mlb::MemoryLeakBuster::HeapInfo HeapInfo;
+using HeapInfo = mlb::MemoryLeakBuster::HeapInfo;
 mlbForceLink const HeapInfo* mlbGetHeapInfo(void *p){ return g_mlb->getHeapInfo(p); }
 
 mlbForceLink void mlbInspect(void *p)           { g_mlb->inspect(p); }
@@ -807,7 +836,7 @@ mlbForceLink void mlbOutputToFile(bool v)       { g_mlb->enbaleFileOutput(v); }
 class mlbInitializer
 {
 public:
-    mlbInitializer() { mlb::g_mlb=new mlb::MemoryLeakBuster(); }
+    mlbInitializer() { mlb::g_mlb = new mlb::MemoryLeakBuster(); }
     ~mlbInitializer() { delete mlb::g_mlb; }
 };
 
