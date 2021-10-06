@@ -47,12 +47,12 @@
 namespace mlb {
 
 // 保持する callstack の最大段数
-const size_t MaxCallstackDepth = 32;
+static const size_t MaxCallstackDepth = 32;
 
 // リークチェッカを仕掛ける対象となるモジュール名のリスト。(dll or exe)
 // EnumProcessModules でロードされている全モジュールに仕掛けることもできるが、色々誤判定されるので絞ったほうがいいと思われる。
 // /MT や /MTd でビルドされたモジュールのリークチェックをしたい場合、このリストに対象モジュールを書けばいけるはず。
-const char *g_target_modules[] = {
+static const char* g_target_modules[] = {
     "ucrtbase.dll",
     "ucrtbased.dll",
 
@@ -62,10 +62,6 @@ const char *g_target_modules[] = {
     "msvcr110d.dll",
     "msvcr100.dll",
     "msvcr100d.dll",
-    "msvcr90.dll",
-    "msvcr90d.dll",
-    "msvcr80.dll",
-    "msvcr80d.dll",
     "msvcrt.dll",
 };
 
@@ -73,7 +69,7 @@ const char *g_target_modules[] = {
 // 一部の CRT 関数などは確保したメモリをモジュール開放時にまとめて開放する仕様になっており、
 // リーク情報を出力する時点ではモジュールはまだ開放されていないため、リーク判定されてしまう。そういう関数を無視できるようにしている。
 // (たぶん下記以外にもある)
-const char *g_ignore_list[] = {
+static const char* g_ignore_list[] = {
     "!unlock",
     "!fopen",
     "!setlocale",
@@ -104,7 +100,8 @@ const char *g_ignore_list[] = {
 #include <map>
 #include <set>
 #include <algorithm>
-#include <cinttypes>
+#include <chrono>
+#include <cstdint>
 #define mlbForceLink   __declspec(dllexport)
 
 #ifdef _M_X64
@@ -115,31 +112,36 @@ const char *g_ignore_list[] = {
 
 namespace mlb {
 
-using uint32 = unsigned int;
-using uint64 = unsigned long long;
+using nanosec = uint64_t;
 using HeapAllocT = LPVOID (WINAPI *)( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
 using HeapReAllocT = LPVOID (WINAPI *)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
 using HeapFreeT = BOOL (WINAPI *)( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
 
 // 乗っ取り前の HeapAlloc/Free
-HeapAllocT      HeapAlloc_Orig = nullptr;
-HeapReAllocT    HeapReAlloc_Orig = nullptr;
-HeapFreeT       HeapFree_Orig = nullptr;
+static HeapAllocT      HeapAlloc_Orig = nullptr;
+static HeapReAllocT    HeapReAlloc_Orig = nullptr;
+static HeapFreeT       HeapFree_Orig = nullptr;
 
 // 乗っ取り後の HeapAlloc/Free
-LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
-LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
-BOOL   WINAPI HeapFree_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
+static LPVOID WINAPI HeapAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
+static LPVOID WINAPI HeapReAlloc_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes );
+static BOOL   WINAPI HeapFree_Hooked( HANDLE hHeap, DWORD dwFlags, LPVOID lpMem );
 
-void* mlbMalloc(size_t size)    { return HeapAlloc_Orig((HANDLE)_get_heap_handle(), 0, size); }
-void  mlbFree(void *p)          { HeapFree_Orig((HANDLE)_get_heap_handle(), 0, p); }
+static nanosec mlbNow()
+{
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
-template<class T> T* mlbNew()
+static void* mlbMalloc(size_t size)    { return HeapAlloc_Orig((HANDLE)_get_heap_handle(), 0, size); }
+static void  mlbFree(void *p)          { HeapFree_Orig((HANDLE)_get_heap_handle(), 0, p); }
+
+template<class T> static T* mlbNew()
 {
     return new (mlbMalloc(sizeof(T))) T();
 }
 
-template<class T> void mlbDelete(T *v)
+template<class T> static void mlbDelete(T *v)
 {
     if (v) {
         v->~T();
@@ -147,7 +149,7 @@ template<class T> void mlbDelete(T *v)
     }
 }
 
-bool InitializeDebugSymbol(HANDLE proc = ::GetCurrentProcess())
+static bool InitializeDebugSymbol(HANDLE proc = ::GetCurrentProcess())
 {
     if(!::SymInitialize(proc, nullptr, TRUE)) {
         return false;
@@ -156,14 +158,14 @@ bool InitializeDebugSymbol(HANDLE proc = ::GetCurrentProcess())
     return true;
 }
 
-void FinalizeDebugSymbol(HANDLE proc=::GetCurrentProcess())
+static void FinalizeDebugSymbol(HANDLE proc=::GetCurrentProcess())
 {
     ::SymCleanup(proc);
 }
 
 // 指定のアドレスが現在のモジュールの static 領域内であれば true
 // * 呼び出し元モジュールの static 領域しか判別できません
-bool IsStaticMemory(void *addr)
+static bool IsStaticMemory(void *addr)
 {
     MODULEINFO modinfo;
     {
@@ -177,19 +179,24 @@ bool IsStaticMemory(void *addr)
 
 // 指定アドレスが現在のスレッドの stack 領域内であれば true
 // * 現在のスレッドの stack しか判別できません
-bool IsStackMemory(void* addr)
+static bool IsStackMemory(void* addr)
 {
     NT_TIB *tib = reinterpret_cast<NT_TIB*>(::NtCurrentTeb());
     return addr>=tib->StackLimit && addr<tib->StackBase;
 }
 
-int GetCallstack(void **callstack, size_t callstack_size)
+static int GetCallstack(void **callstack, size_t callstack_size)
 {
     return CaptureStackBackTrace(1, (DWORD)callstack_size, callstack, nullptr);
 }
+template<size_t N>
+static int GetCallstack(void* (&callstack)[N])
+{
+    return GetCallstack(callstack, N);
+}
 
 template<class String>
-void AddressToSymbolName(String& out_text, void* address, HANDLE proc = ::GetCurrentProcess())
+static void AddressToSymbolName(String& out_text, void* address, HANDLE proc = ::GetCurrentProcess())
 {
 #ifdef _WIN64
     typedef DWORD64 DWORDX;
@@ -228,31 +235,39 @@ void AddressToSymbolName(String& out_text, void* address, HANDLE proc = ::GetCur
 }
 
 template<class String>
-void CallstackToSymbolNames_Stripped(String& out_text, void* const* callstack, int callstack_size, String& buf)
+static void CallstackToSymbolNamesStripped(String& out_text, void* const* callstack, int callstack_size, String& buf)
 {
     buf.clear();
-    for(int i=0; i<callstack_size; ++i) {
+    for (int i = 0; i < callstack_size; ++i)
         AddressToSymbolName(buf, callstack[i]);
-    }
 
     size_t begin = 0;
     size_t end = buf.size();
     {
         size_t pos = buf.find("!aligned_malloc ");
-        if (pos == String::npos) { pos = buf.find("!malloc "); }
+        if (pos == String::npos)
+            pos = buf.find("!malloc ");
         if (pos != String::npos) {
             for (;;) {
-                if (buf[++pos] == '\n') { begin = ++pos; break; }
+                if (buf[++pos] == '\n') {
+                    begin = ++pos;
+                    break;
+                }
             }
         }
     }
     {
         size_t pos = buf.find("!__tmainCRTStartup ", begin);
-        if (pos == String::npos) { pos = buf.find("!endthreadex ", begin); }
-        if (pos == String::npos) { pos = buf.find("!BaseThreadInitThunk ", begin); }
+        if (pos == String::npos)
+            pos = buf.find("!endthreadex ", begin);
+        if (pos == String::npos)
+            pos = buf.find("!BaseThreadInitThunk ", begin); 
         if (pos != String::npos) {
             for (;;) {
-                if (buf[--pos] == '\n') { end = ++pos; break; }
+                if (buf[--pos] == '\n') {
+                    end = ++pos;
+                    break;
+                }
             }
         }
     }
@@ -295,38 +310,34 @@ private:
 template<typename T>
 class OrigHeapAllocator {
 public : 
-    typedef T value_type;
-    typedef value_type* pointer;
-    typedef const value_type* const_pointer;
-    typedef value_type& reference;
-    typedef const value_type& const_reference;
-    typedef std::size_t size_type;
-    typedef std::ptrdiff_t difference_type;
+    // for C++17 or newer
+    using value_type = T;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using propagate_on_container_move_assignment = std::true_type;
 
-    template<typename U> struct rebind { typedef OrigHeapAllocator<U> other; };
-
-public : 
     OrigHeapAllocator() {}
-    OrigHeapAllocator(const OrigHeapAllocator&) {}
-    template<typename U> OrigHeapAllocator(const OrigHeapAllocator<U>&) {}
-    ~OrigHeapAllocator() {}
+    template <class U> OrigHeapAllocator(const OrigHeapAllocator<U>&) noexcept {}
+    template <class U> bool operator==(const OrigHeapAllocator<U>&) const { return true; }
+    template <class U> bool operator!=(const OrigHeapAllocator<U>&) const { return false; }
+
+    T* allocate(size_type cnt, const void* = nullptr) { return (T*)mlbMalloc(cnt * sizeof(T)); }
+    void deallocate(T* p, size_type) { mlbFree(p); }
+
+public:
+    // for C++14 or older
+    using pointer = T*;
+    using const_pointer = const T*;
+    using reference = T&;
+    using const_reference = const T&;
+    template<typename U> struct rebind { typedef OrigHeapAllocator<U> other; };
 
     pointer address(reference r) { return &r; }
     const_pointer address(const_reference r) { return &r; }
-
-    pointer allocate(size_type cnt, const void *p=NULL) { p; return (pointer)mlbMalloc(cnt * sizeof(T)); }
-    void deallocate(pointer p, size_type) { mlbFree(p); }
-
     size_type max_size() const { return std::numeric_limits<size_type>::max() / sizeof(T); }
-
     void construct(pointer p, const T& t) { new(p) T(t); }
     void destroy(pointer p) { p; p->~T(); }
-
-    bool operator==(OrigHeapAllocator const&) { return true; }
-    bool operator!=(OrigHeapAllocator const& a) { return !operator==(a); }
 };
-template<class T, typename Alloc> inline bool operator==(const OrigHeapAllocator<T>& l, const OrigHeapAllocator<T>& r) { return (l.equals(r)); }
-template<class T, typename Alloc> inline bool operator!=(const OrigHeapAllocator<T>& l, const OrigHeapAllocator<T>& r) { return (!(l == r)); }
 
 using TempString = std::basic_string<char, std::char_traits<char>, OrigHeapAllocator<char> >;
 using StringCont = std::vector<TempString, OrigHeapAllocator<TempString> >;
@@ -335,7 +346,8 @@ using StringCont = std::vector<TempString, OrigHeapAllocator<TempString> >;
 
 
 // write protect がかかったメモリ領域を強引に書き換える
-template<class T> inline void ForceWrite(T &dst, const T &src)
+template<class T>
+static inline void ForceWrite(T &dst, const T &src)
 {
     DWORD old_flag;
     ::VirtualProtect(&dst, sizeof(T), PAGE_EXECUTE_READWRITE, &old_flag);
@@ -346,7 +358,7 @@ template<class T> inline void ForceWrite(T &dst, const T &src)
 
 // F: functor。引数は (const char *dllname, const char *funcname, void *&func)
 template<class F>
-bool EachImportFunction(HMODULE module, const F& f)
+static bool EachImportFunction(HMODULE module, const F& f)
 {
     if (!module)
         return false;
@@ -377,31 +389,34 @@ bool EachImportFunction(HMODULE module, const F& f)
     return true;
 }
 
-void SaveOrigHeapAlloc()
+static void SaveOrigHeapAlloc()
 {
     HeapAlloc_Orig  = &HeapAlloc;
     HeapReAlloc_Orig= &HeapReAlloc;
     HeapFree_Orig   = &HeapFree;
 }
 
-void HookHeapAlloc(const char *modulename)
+static void HookHeapAlloc(const char *modulename)
 {
-    auto do_hook = [](const char* dllname, const char* funcname, void*& func) {
-        if (strcmp(funcname, "HeapAlloc") == 0) {
-            ForceWrite<void*>(func, HeapAlloc_Hooked);
-        }
-        else if (strcmp(funcname, "HeapReAlloc") == 0) {
-            ForceWrite<void*>(func, HeapReAlloc_Hooked);
-        }
-        else if (strcmp(funcname, "HeapFree") == 0) {
-            ForceWrite<void*>(func, HeapFree_Hooked);
+    const std::pair<const char*, void*> table[] = {
+        {"HeapAlloc", HeapAlloc_Hooked},
+        {"HeapReAlloc", HeapReAlloc_Hooked},
+        {"HeapFree", HeapFree_Hooked},
+    };
+
+    auto do_hook = [&table](const char* dllname, const char* funcname, void*& func) {
+        for (auto& v : table) {
+            if (strcmp(funcname, v.first) == 0) {
+                ForceWrite<void*>(func, v.second);
+                break;
+            }
         }
     };
 
     EachImportFunction(::GetModuleHandleA(modulename), do_hook);
 }
 
-void HookHeapAlloc(const StringCont &modules)
+static void HookHeapAlloc(const StringCont &modules)
 {
     HookHeapAlloc(nullptr); // exe を hook
     for (auto& mod : modules) {
@@ -409,17 +424,20 @@ void HookHeapAlloc(const StringCont &modules)
     }
 }
 
-void UnhookHeapAlloc(const StringCont &modules)
+static void UnhookHeapAlloc(const StringCont &modules)
 {
-    auto do_unhook = [](const char* dllname, const char* funcname, void*& func) {
-        if (strcmp(funcname, "HeapAlloc") == 0) {
-            ForceWrite<void*>(func, HeapAlloc_Orig);
-        }
-        else if (strcmp(funcname, "HeapReAlloc") == 0) {
-            ForceWrite<void*>(func, HeapReAlloc_Orig);
-        }
-        else if (strcmp(funcname, "HeapFree") == 0) {
-            ForceWrite<void*>(func, HeapFree_Orig);
+    const std::pair<const char*, void*> table[] = {
+        {"HeapAlloc", HeapAlloc_Orig},
+        {"HeapReAlloc", HeapReAlloc_Orig},
+        {"HeapFree", HeapFree_Orig},
+    };
+
+    auto do_unhook = [&table](const char* dllname, const char* funcname, void*& func) {
+        for (auto& v : table) {
+            if (strcmp(funcname, v.first) == 0) {
+                ForceWrite<void*>(func, v.second);
+                break;
+            }
         }
     };
 
@@ -435,10 +453,11 @@ public:
     {
         void *address = nullptr;
         size_t size = 0;
+        nanosec time = 0;
         void* callstack[MaxCallstackDepth]{};
-        uint32 callstack_size = 0;
-        uint32 id = 0;
-        uint32 count = 0;
+        uint32_t callstack_size = 0;
+        uint32_t id = 0;
+        uint32_t count = 0;
     };
 
     struct less_callstack
@@ -453,17 +472,17 @@ public:
             }
         };
     };
-    using HeapTable = std::map<void*, HeapInfo, std::less<void*>, OrigHeapAllocator<std::pair<const void*, HeapInfo> > >;
+    using HeapTable = std::map<void*, HeapInfo, std::less<void*>, OrigHeapAllocator<std::pair<void* const, HeapInfo> > >;
     using CountTable = std::set<HeapInfo, less_callstack, OrigHeapAllocator<HeapInfo> >;
 
     union Flags
     {
         struct {
-            uint32 enable_leakcheck: 1;
-            uint32 enable_scopedcheck: 1;
-            uint32 enable_counter: 1;
+            uint32_t enable_leakcheck: 1;
+            uint32_t enable_scopedcheck: 1;
+            uint32_t enable_counter: 1;
         };
-        uint32 i;
+        uint32_t i;
     };
 
     MemoryLeakBuster()
@@ -508,15 +527,16 @@ public:
 
     bool loadConfig()
     {
-        for (size_t i = 0; i < std::size(g_target_modules); ++i)
-            m_modules->push_back(g_target_modules[i]);
-        for (size_t i = 0; i < std::size(g_ignore_list); ++i)
-            m_ignores->push_back(g_ignore_list[i]);
+        for (auto* mod : g_target_modules)
+            m_modules->push_back(mod);
+
+        for (auto* pattern : g_ignore_list)
+            m_ignores->push_back(pattern);
 
         char buf[256];
         if (FILE* f = fopen("mlbConfig.txt", "r")) {
             int i;
-            char s[128];
+            char s[128]{};
             while (fgets(buf, (int)std::size(buf), f)) {
                 if (sscanf(buf, "disable: %d", &i) == 1) { m_flags.enable_leakcheck = (i != 1); }
                 else if (sscanf(buf, "fileoutput: %d", &i) == 1) { enbaleFileOutput(i != 0); }
@@ -548,7 +568,8 @@ public:
         HeapInfo cs;
         cs.address = p;
         cs.size = size;
-        cs.callstack_size = GetCallstack(cs.callstack, std::size(cs.callstack));
+        cs.time = mlbNow();
+        cs.callstack_size = GetCallstack(cs.callstack);
         cs.count = 0;
         {
             Mutex::ScopedLock l(*m_mutex);
@@ -642,9 +663,9 @@ public:
         char buf[128];
         TempString text, bufstr;
         text.reserve(1024*16);
-        snprintf(buf, std::size(buf), "0x%p (%llu byte) ", r->address, (uint64)r->size); text+=buf;
+        snprintf(buf, std::size(buf), "0x%p (%zu byte) ", r->address, r->size); text+=buf;
         snprintf(buf, std::size(buf), "prev: 0x%p next: 0x%p\n", neighbor[0], neighbor[1]); text+=buf;
-        CallstackToSymbolNames_Stripped(text, r->callstack, r->callstack_size, bufstr);
+        CallstackToSymbolNamesStripped(text, r->callstack, r->callstack_size, bufstr);
         ::OutputDebugStringA(text.c_str());
     }
 
@@ -661,9 +682,9 @@ public:
             const auto& ai = kvp.second;
 
             text.clear();
-            snprintf(buf, std::size(buf), "memory leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
+            snprintf(buf, std::size(buf), "memory leak: 0x%p (%zu byte)\n", ai.address, ai.size);
             text += buf;
-            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
+            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             if (!shouldBeIgnored(text)) {
                 output(text.c_str(), text.size());
@@ -694,9 +715,9 @@ public:
                 continue;
 
             text.clear();
-            snprintf(buf, std::size(buf), "maybe a leak: 0x%p (%llu byte)\n", ai.address, (uint64)ai.size);
+            snprintf(buf, std::size(buf), "maybe a leak: 0x%p (%zu byte)\n", ai.address, ai.size);
             text += buf;
-            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
+            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             if(!shouldBeIgnored(text)) {
                 output(text.c_str(), text.size());
@@ -722,14 +743,14 @@ public:
         int total = 0;
         char buf[128];
         TempString text, bufstr;
-        text.reserve(1024*16);
+        text.reserve(1024 * 16);
         for (auto& kvp : *m_heapinfo) {
             const auto& ai = kvp.second;
 
             text.clear();
             snprintf(buf, std::size(buf), "%d times from\n", ai.count);
             text += buf;
-            CallstackToSymbolNames_Stripped(text, ai.callstack, ai.callstack_size, bufstr);
+            CallstackToSymbolNamesStripped(text, ai.callstack, ai.callstack_size, bufstr);
             text += "\n";
             output(text.c_str(), text.size());
             total += ai.count;
@@ -770,21 +791,21 @@ private:
     CountTable *m_counter = nullptr;
     StringCont *m_modules = nullptr;
     StringCont *m_ignores = nullptr;
-    uint32 m_idgen = 0;
-    uint32 m_scope = INT_MAX;
+    uint32_t m_idgen = 0;
+    uint32_t m_scope = INT_MAX;
     Flags m_flags{};
 };
 
-MemoryLeakBuster *g_mlb;
+static MemoryLeakBuster *g_mlb;
 
-LPVOID WINAPI HeapAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
+static LPVOID WINAPI HeapAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 {
     LPVOID p = HeapAlloc_Orig(hHeap, dwFlags, dwBytes);
     g_mlb->addHeapInfo(p, dwBytes);
     return p;
 }
 
-LPVOID WINAPI HeapReAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes)
+static LPVOID WINAPI HeapReAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes)
 {
     g_mlb->eraseHeapInfo(lpMem);
     LPVOID p = HeapReAlloc_Orig(hHeap, dwFlags, lpMem, dwBytes);
@@ -792,7 +813,7 @@ LPVOID WINAPI HeapReAlloc_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE
     return p;
 }
 
-BOOL WINAPI HeapFree_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem)
+static BOOL WINAPI HeapFree_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem)
 {
     BOOL r = HeapFree_Orig(hHeap, dwFlags, lpMem);
     g_mlb->eraseHeapInfo(lpMem);
