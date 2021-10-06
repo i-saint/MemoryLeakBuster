@@ -47,16 +47,14 @@
 namespace mlb {
 
 // 保持する callstack の最大段数
-const size_t MaxCallstackDepth = 64;
+const size_t MaxCallstackDepth = 32;
 
 // リークチェッカを仕掛ける対象となるモジュール名のリスト。(dll or exe)
 // EnumProcessModules でロードされている全モジュールに仕掛けることもできるが、色々誤判定されるので絞ったほうがいいと思われる。
 // /MT や /MTd でビルドされたモジュールのリークチェックをしたい場合、このリストに対象モジュールを書けばいけるはず。
 const char *g_target_modules[] = {
-    "msvcp140.dll",
-    "msvcp140d.dll",
-    "vcruntime140.dll",
-    "vcruntime140d.dll",
+    "ucrtbase.dll",
+    "ucrtbased.dll",
 
     "msvcr120.dll",
     "msvcr120d.dll",
@@ -346,10 +344,9 @@ template<class T> inline void ForceWrite(T &dst, const T &src)
 }
 
 
-// dllname: 大文字小文字区別しません
-// F: functor。引数は (const char *funcname, void *&func)
+// F: functor。引数は (const char *dllname, const char *funcname, void *&func)
 template<class F>
-bool EachImportFunction(HMODULE module, const char *dllname, const F &f)
+bool EachImportFunction(HMODULE module, const F& f)
 {
     if (!module)
         return false;
@@ -366,31 +363,18 @@ bool EachImportFunction(HMODULE module, const char *dllname, const F &f)
 
     IMAGE_IMPORT_DESCRIPTOR* pImportDesc = (IMAGE_IMPORT_DESCRIPTOR*)(ImageBase + RVAImports);
     while (pImportDesc->Name != 0) {
-        if (stricmp((const char*)(ImageBase + pImportDesc->Name), dllname) == 0) {
-            IMAGE_IMPORT_BY_NAME** func_names = (IMAGE_IMPORT_BY_NAME**)(ImageBase + pImportDesc->Characteristics);
-            void** import_table = (void**)(ImageBase + pImportDesc->FirstThunk);
-            for (size_t i = 0; ; ++i) {
-                if ((size_t)func_names[i] == 0)
-                    break;
-                auto* funcname = (const char*)(ImageBase + (size_t)func_names[i]->Name);
-                f(funcname, import_table[i]);
-            }
+        auto dllname = (const char*)(ImageBase + pImportDesc->Name);
+        IMAGE_IMPORT_BY_NAME** func_names = (IMAGE_IMPORT_BY_NAME**)(ImageBase + pImportDesc->Characteristics);
+        void** import_table = (void**)(ImageBase + pImportDesc->FirstThunk);
+        for (size_t i = 0; ; ++i) {
+            if ((size_t)func_names[i] == 0)
+                break;
+            auto* funcname = (const char*)(ImageBase + (size_t)func_names[i]->Name);
+            f(dllname, funcname, import_table[i]);
         }
         ++pImportDesc;
     }
     return true;
-}
-
-template<class F>
-void EachImportFunctionInEveryModule(const char *dllname, const F &f)
-{
-    std::vector<HMODULE> modules;
-    DWORD num_modules;
-    ::EnumProcessModules(::GetCurrentProcess(), nullptr, 0, &num_modules);
-    modules.resize(num_modules / sizeof(HMODULE));
-    ::EnumProcessModules(::GetCurrentProcess(), &modules[0], num_modules, &num_modules);
-    for (auto& mod : modules)
-        EachImportFunction<F>(mod, dllname, f);
 }
 
 void SaveOrigHeapAlloc()
@@ -402,7 +386,7 @@ void SaveOrigHeapAlloc()
 
 void HookHeapAlloc(const char *modulename)
 {
-    auto do_hook = [](const char* funcname, void*& func) {
+    auto do_hook = [](const char* dllname, const char* funcname, void*& func) {
         if (strcmp(funcname, "HeapAlloc") == 0) {
             ForceWrite<void*>(func, HeapAlloc_Hooked);
         }
@@ -414,7 +398,7 @@ void HookHeapAlloc(const char *modulename)
         }
     };
 
-    EachImportFunction(::GetModuleHandleA(modulename), "kernel32.dll", do_hook);
+    EachImportFunction(::GetModuleHandleA(modulename), do_hook);
 }
 
 void HookHeapAlloc(const StringCont &modules)
@@ -427,7 +411,7 @@ void HookHeapAlloc(const StringCont &modules)
 
 void UnhookHeapAlloc(const StringCont &modules)
 {
-    auto do_unhook = [](const char* funcname, void*& func) {
+    auto do_unhook = [](const char* dllname, const char* funcname, void*& func) {
         if (strcmp(funcname, "HeapAlloc") == 0) {
             ForceWrite<void*>(func, HeapAlloc_Orig);
         }
@@ -440,7 +424,7 @@ void UnhookHeapAlloc(const StringCont &modules)
     };
 
     for (auto& mod : modules) {
-        EachImportFunction(::GetModuleHandleA(mod.c_str()), "kernel32.dll", do_unhook);
+        EachImportFunction(::GetModuleHandleA(mod.c_str()), do_unhook);
     }
 }
 
@@ -493,8 +477,8 @@ public:
         m_modules   = mlbNew<StringCont>();
         m_ignores   = mlbNew<StringCont>();
         loadConfig();
-        HookHeapAlloc(*m_modules);
         InitializeDebugSymbol();
+        HookHeapAlloc(*m_modules);
     }
 
     ~MemoryLeakBuster()
@@ -503,16 +487,16 @@ public:
             return;
         Mutex::ScopedLock l(*m_mutex);
 
-        printLeakInfo();
         UnhookHeapAlloc(*m_modules);
+        printLeakInfo();
 
         // 解放後もアクセスされる可能性がある点に注意が必要
         // 全チェックを無効化して他のメンバ変数にアクセスされないようにします
         m_flags.i = 0;
-        mlbDelete(m_ignores);   m_ignores=NULL;
-        mlbDelete(m_modules);   m_modules=NULL;
-        mlbDelete(m_counter);   m_counter=NULL;
-        mlbDelete(m_heapinfo);  m_heapinfo=NULL;
+        mlbDelete(m_ignores);  m_ignores = nullptr;
+        mlbDelete(m_modules);  m_modules = nullptr;
+        mlbDelete(m_counter);  m_counter = nullptr;
+        mlbDelete(m_heapinfo); m_heapinfo = nullptr;
 
         // m_mutex は開放しません
         // 別スレッドから HeapFree_Hooked() が呼ばれて mutex を待ってる間に
