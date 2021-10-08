@@ -102,8 +102,8 @@ static const char* g_ignore_list[] = {
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#define mlbForceLink   __declspec(dllexport)
 
+#define mlbForceLink   __declspec(dllexport)
 #ifdef _M_X64
     #define fHex "llx"
 #else
@@ -390,6 +390,22 @@ static bool EachImportFunction(HMODULE module, const F& f)
     return true;
 }
 
+
+// HeapAlloc() を提供する dll なら true
+static bool IsKernelModule(const char* modulename)
+{
+    const char* patterns[] = {
+        "kernel32.dll",
+        "api-ms-win-core-heap", // api-ms-win-core-heap-l1-1-0.dll など
+    };
+    for (auto* pattern : patterns) {
+        if (strstr(modulename, pattern))
+            return true;
+
+    }
+    return false;
+}
+
 static void SaveOrigHeapAlloc()
 {
     HeapAlloc_Orig  = &HeapAlloc;
@@ -406,6 +422,8 @@ static void HookHeapAlloc(const char *modulename)
     };
 
     auto do_hook = [&table](const char* dllname, const char* funcname, void*& func) {
+        if (!IsKernelModule(dllname))
+            return;
         for (auto& v : table) {
             if (strcmp(funcname, v.first) == 0) {
                 ForceWrite<void*>(func, v.second);
@@ -434,6 +452,8 @@ static void UnhookHeapAlloc(const StringCont &modules)
     };
 
     auto do_unhook = [&table](const char* dllname, const char* funcname, void*& func) {
+        if (!IsKernelModule(dllname))
+            return;
         for (auto& v : table) {
             if (strcmp(funcname, v.first) == 0) {
                 ForceWrite<void*>(func, v.second);
@@ -672,7 +692,7 @@ void MemoryLeakBuster::inspect(void* p) const
     }
 
     const HeapInfo* r = nullptr;
-    const void* neighbor[2] = { nullptr, nullptr };
+    const void* neighbor[2]{};
     {
         Mutex::ScopedLock l(*m_mutex);
         if (!m_heapinfo)
@@ -699,6 +719,7 @@ void MemoryLeakBuster::inspect(void* p) const
         ::OutputDebugStringA("no information.\n");
         return;
     }
+
     char buf[128];
     TempString text, bufstr;
     text.reserve(1024 * 16);
@@ -849,34 +870,44 @@ static BOOL WINAPI HeapFree_Hooked(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem)
 
 } /// namespace mlb
 
-using namespace mlb;
+mlbForceLink void mlbInitialize()
+{
+    if (!mlb::g_mlb)
+        mlb::g_mlb = new mlb::MemoryLeakBuster();
+}
 
+mlbForceLink void mlbFinalize()
+{
+    delete mlb::g_mlb;
+    mlb::g_mlb = nullptr;
+}
 
 // イミディエイトウィンドウから実行可能な関数群
 using HeapInfo = mlb::MemoryLeakBuster::HeapInfo;
-mlbForceLink const HeapInfo* mlbGetHeapInfo(void *p){ return g_mlb->getHeapInfo(p); }
+mlbForceLink const HeapInfo* mlbGetHeapInfo(void *p)
+{
+    return mlb::g_mlb->getHeapInfo(p);
+}
 
-mlbForceLink void mlbInspect(void *p)           { g_mlb->inspect(p); }
-mlbForceLink void mlbBeginScope()               { g_mlb->beginScope(); }
-mlbForceLink void mlbEndScope()                 { g_mlb->endScope(); }
-mlbForceLink void mlbBeginCount()               { g_mlb->beginCount(); }
-mlbForceLink void mlbEndCount()                 { g_mlb->endCount(); }
-mlbForceLink void mlbOutputToFile(bool v)       { g_mlb->enbaleFileOutput(v); }
+mlbForceLink void mlbInspect(void *p)     { mlb::g_mlb->inspect(p); }
+mlbForceLink void mlbBeginScope()         { mlb::g_mlb->beginScope(); }
+mlbForceLink void mlbEndScope()           { mlb::g_mlb->endScope(); }
+mlbForceLink void mlbBeginCount()         { mlb::g_mlb->beginCount(); }
+mlbForceLink void mlbEndCount()           { mlb::g_mlb->endCount(); }
+mlbForceLink void mlbOutputToFile(bool v) { mlb::g_mlb->enbaleFileOutput(v); }
 
 #ifndef mlbDLL
-
-class mlbInitializer
+namespace mlb {
+class Initializer
 {
 public:
-    mlbInitializer() { mlb::g_mlb = new mlb::MemoryLeakBuster(); }
-    ~mlbInitializer() { delete mlb::g_mlb; }
+    Initializer() { mlbInitialize(); }
+    ~Initializer() { mlbFinalize(); }
 };
 
-namespace mlb {
 #pragma warning(disable: 4073) // init_seg(lib) 使うと出る warning。正当な理由があるので黙らせる
 #pragma init_seg(lib) // global オブジェクトの初期化の優先順位上げる
 // global 変数にすることで main 開始前に初期化、main 抜けた後に終了処理をさせる。
-mlbInitializer g_initializer;
+mlbForceLink Initializer g_initializer;
 } // namespace mlb
-
 #endif // mlbDLL
